@@ -1,0 +1,38 @@
+That's the answer. The message is coming from pipeline_info_helper.py, not from mmm_dev_data_transfer itself.
+
+Look at lines 122 and 774:
+
+
+pipeline_info_helper.py
+Lines 122-122
+logger = get_context_logger(__name__)
+
+pipeline_info_helper.py
+Lines 774-780
+                    logger.warning(
+                        f"✓ Updated pipeline info using discovered key: {client_id}/{discovered_key}. "
+                        f"ACTION REQUIRED: Migrate record to normalized format '{brand_retailer_key}'. "
+                        f"Migration steps: 1) Update create_pipeline_info() to auto-normalize keys, "
+                        f"2) Run migration script to update existing records, "
+                        f"3) Remove discovery logic from update_pipeline_info()."
+                    )
+This is a raw logger.warning(...) call on the stdlib ContextLogger — not MikAura. That's why you see the plain-text [WARNING] format with the | brand_id=... client_id=... context suffix (which is how ContextLogger.format_context_suffix() works) rather than structured JSON.
+
+Why it wasn't migrated
+pipeline_info_helper.py imports MikAuraStatusLogger only as a type hint (line 102), but the class itself has no status_logger parameter on any of its methods. The helper uses its own module-level logger = get_context_logger(__name__) for all its internal logging. There are zero status_logger references anywhere in the file.
+
+The compliance fix plan explicitly listed pipeline_info_helper.py under "No-Change Surfaces" to avoid risk — its update_pipeline_info(), create_pipeline_info(), and other methods all use raw logger.* calls.
+
+What's happening at runtime
+mmm_dev_data_transfer.lambda_handler()
+  └── update_pipeline_info_after_transfer()          # in data_transfer lambda
+        └── helper.update_pipeline_info(...)          # calls into pipeline_info_helper.py
+              └── logger.warning("✓ Updated pipeline info using discovered key...")
+                    │
+                    ├── logger = ContextLogger(__name__)
+                    ├── _msg() appends ingestion_context suffix: "| brand_id=... client_id=..."
+                    └── _logger.warning(plain_text)   ← this is what you see
+The ingestion_context(...) block set by the data_transfer Lambda's handler is still active when pipeline_info_helper runs, so ContextLogger appends all those context fields as a plain-text suffix. But it's stdlib logging, not MikAura structured JSON.
+
+To fix this
+pipeline_info_helper.py would need the same treatment as the Lambda functions: accept an optional status_logger parameter on its public methods and route through it when available, falling back to logger.* when not. That's a separate migration scope since the helper has ~30+ logger.* calls across its 1,554 lines.
