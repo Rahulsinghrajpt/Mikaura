@@ -1,0 +1,14 @@
+Track 2: Migrate Helper to MikAura (Logging Path) 📊
+Priority: MEDIUM | Effort: 2-3 days | Risk: Medium
+
+Fix Root Cause A:
+
+Add optional status_logger parameter to helper public methods
+Create _helper_info/warning/error wrappers (same pattern as Lambda)
+Convert 53 logger.* calls to use wrappers
+Pass status_logger=_mikaura_sl from all Lambda call sites
+Result:
+
+✅ Full MikAura compliance for helper module
+✅ Structured logging for all helper operations
+✅ Consistent observability across codebase
