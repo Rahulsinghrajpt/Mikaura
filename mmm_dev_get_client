@@ -1,0 +1,533 @@
+"""
+Lambda Function: mmm_dev_get_client (Lambda 1)
+
+Purpose: 
+Retrieves active clients from the pipeline-infos DynamoDB table.
+First step in the data ingestion Step Function orchestration.
+
+Integration Points:
+- Step Function: mmm-{env}-data-ingestion-workflow triggers this Lambda
+- EventBridge: Scheduled daily at 5 AM UTC
+- DynamoDB: Queries mmm-{env}-pipeline-infos using ActiveClientsIndex GSI
+- S3: Writes execution logs to mmm-{env}-audit-logs bucket
+
+Configuration:
+- FunctionName: mmm_{env}_get_client
+- Runtime: python3.12
+- Timeout: 15 seconds (default, configurable)
+- Memory: 512 MB (default, configurable)
+
+Environment Variables:
+- DATA_TABLE: DynamoDB table name (default: mmm-dev-pipeline-infos)
+- S3_LOG_BUCKET: S3 bucket for logs (default: mmm-dev-audit-logs)
+- S3_PREFIX: S3 prefix for logs (default: get_client_metadata_lambda_logs/)
+- AWS_REGION: AWS region (default: eu-west-1)
+- LOG_LEVEL: Logging level (default: INFO)
+
+Observability:
+- Operational lifecycle and outcomes: MikAura JSON on stdout (single path when MikAura is available).
+- Technical debug: ContextLogger at DEBUG (e.g. S3 write path confirmation).
+- If MikAura import fails, operational events fall back to ContextLogger only.
+
+Input: Event from EventBridge/Step Function (no parameters needed)
+
+Output (passed to Step Function Map state):
+{
+    "clients": [
+        {
+            "client_id": "madebygather",
+            "client_name": "Made by Gather",
+            "brand_id": "bella-US",
+            "brand_name": "bella-US",
+            "retailer_id": "amazon",
+            "retailer_name": "Amazon",
+            "brand_retailer_key": "bella-US#amazon",
+            "region": "eu-west-1",
+            "last_trained_date": "2025-12-01",
+            "next_training_due": "2025-12-08"
+        }
+    ],
+    "status": "success",
+    "rows_returned": 1,
+    "timestamp": "2025-12-07T06:00:00.000000Z"
+}
+
+Version: 2.0.0
+Date: 2025-12-07
+"""
+
+import boto3
+import os
+import json
+import logging
+import traceback
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from boto3.dynamodb.conditions import Key, Attr
+from botocore.exceptions import ClientError
+
+# Import pipeline configuration
+try:
+    import sys
+    lambda_dir = os.path.dirname(os.path.abspath(__file__))
+    src_path = os.path.join(lambda_dir, 'src')
+    if not os.path.exists(src_path):
+        src_path = os.path.join(os.path.dirname(lambda_dir), 'src')
+    if os.path.exists(src_path):
+        sys.path.insert(0, src_path)
+    from utils.pipeline_config import PipelineConfiguration, get_config
+    CONFIG_AVAILABLE = True 
+except ImportError as e:
+    CONFIG_AVAILABLE = False
+    import sys
+    print(f"WARNING: Pipeline configuration not available: {e}", file=sys.stderr)
+
+# ============================================================================
+# CONFIGURATION - Environment Variables with Defaults
+# ============================================================================
+
+# Load configuration
+if CONFIG_AVAILABLE:
+    config = get_config()
+    DATA_TABLE = config.get_pipeline_info_table_name()
+    S3_LOG_BUCKET = config.s3.audit_logs_bucket
+    AWS_REGION = config.pipeline.aws_region
+else:
+    # Fallback to environment variables if config not available
+    DATA_TABLE = os.environ.get("DATA_TABLE", "mmm-dev-pipeline-infos")
+    S3_LOG_BUCKET = os.environ.get("S3_LOG_BUCKET", "mmm-dev-audit-logs")
+    AWS_REGION = os.environ.get("AWS_REGION", "eu-west-1")
+
+S3_PREFIX = os.environ.get("S3_PREFIX", "get_client_metadata_lambda_logs/")
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+
+# Pipeline-owned MikAura status vocabulary (strict validation)
+GET_CLIENT_ALLOWED_STATUSES = frozenset(
+    {"running", "success", "failed", "warning", "info"}
+)
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+
+try:
+    from utils.mikaura_observability import (
+        MikAuraObservabilityConfig,
+        MikAuraStatusLogger,
+        MikAuraMetricLogger,
+    )
+    _MIKAURA_AVAILABLE = True
+except ImportError:
+    _MIKAURA_AVAILABLE = False
+
+try:
+    from utils.context_logger import ingestion_context, get_context_logger
+    from utils.metrics_utils import get_metrics_utils
+
+    _get_client_metrics = get_metrics_utils()
+except ImportError:
+    from contextlib import nullcontext
+
+    def ingestion_context(**kwargs):  # type: ignore[misc]
+        return nullcontext()
+
+    _get_client_metrics = None
+
+    def get_context_logger(name: str):  # type: ignore[misc]
+        return logging.getLogger(name)
+
+
+logger = get_context_logger(__name__)
+logger.setLevel(LOG_LEVEL)
+
+
+def _get_client_debug(
+    status_logger: Optional[Any], message: str, **extra: Any
+) -> None:
+    """Structured DEBUG via MikAura when available; else stdlib ContextLogger."""
+    if status_logger:
+        status_logger.log_debug(message, debug_event="get_client_lambda", **extra)
+    else:
+        logger.debug(message)
+
+
+def _get_client_running(
+    status_logger: Optional[Any], message: str, **extra: Any
+) -> None:
+    if status_logger:
+        status_logger.log_running(message, **extra)
+    else:
+        logger.info(message)
+
+
+def _get_client_info(
+    status_logger: Optional[Any],
+    message: str,
+    force: bool = True,
+    **extra: Any,
+) -> None:
+    if status_logger:
+        status_logger.log_info(message, force=force, **extra)
+    else:
+        logger.info(message)
+
+
+def _get_client_warning(status_logger: Optional[Any], message: str, **extra: Any) -> None:
+    if status_logger:
+        status_logger.log_warning(message, **extra)
+    else:
+        logger.warning(message)
+
+
+def _get_client_error(
+    status_logger: Optional[Any],
+    message: str,
+    reason: Optional[str] = None,
+    **extra: Any,
+) -> None:
+    if status_logger:
+        status_logger.log_error(message, reason=reason or message, **extra)
+    else:
+        logger.error(message)
+
+
+def _get_client_success(
+    status_logger: Optional[Any], message: str, **extra: Any
+) -> None:
+    if status_logger:
+        status_logger.log_success(message, **extra)
+    else:
+        # Match legacy ContextLogger wording (tests / log grep expect this phrase).
+        rr = extra.get("rows_returned")
+        if rr is not None:
+            logger.info(f"Successfully retrieved {rr} active clients")
+        else:
+            logger.info(message)
+
+
+def _get_client_exception(
+    status_logger: Optional[Any],
+    message: str,
+    exc: BaseException,
+    **extra: Any,
+) -> None:
+    if status_logger:
+        status_logger.log_exception(message, exc, **extra)
+    else:
+        logger.error(f"{message}: {exc}", exc_info=True)
+
+
+# ============================================================================
+# AWS CLIENT INITIALIZATION
+# ============================================================================
+
+dynamodb = boto3.resource("dynamodb", region_name=AWS_REGION)
+s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def write_log_to_s3(log_data: dict, status_logger: Optional[Any] = None) -> None:
+    """Write execution log to S3 bucket for audit trail."""
+    try:
+        key = f"{S3_PREFIX}log_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.json"
+        s3_client.put_object(
+            Bucket=S3_LOG_BUCKET,
+            Key=key,
+            Body=json.dumps(log_data, indent=2),
+            ContentType="application/json"
+        )
+        _get_client_debug(
+            status_logger,
+            f"Log written to S3: s3://{S3_LOG_BUCKET}/{key}",
+            s3_bucket=S3_LOG_BUCKET,
+            s3_key=key,
+        )
+    except Exception as e:
+        if status_logger:
+            _get_client_warning(
+                status_logger,
+                "Failed to write audit log to S3",
+                reason=str(e),
+            )
+        else:
+            logger.error(f"[S3 Logging Error] Failed to write log to S3: {e}")
+        # Don't raise - logging failure shouldn't fail the Lambda
+
+
+def validate_table_exists(status_logger: Optional[Any] = None):
+    """Validate that DynamoDB table exists."""
+    try:
+        table = dynamodb.Table(DATA_TABLE)
+        # Attempt to access table metadata
+        table.table_status
+        _get_client_info(
+            status_logger,
+            "DynamoDB table verified",
+            data_table=DATA_TABLE,
+            force=True,
+        )
+        return table
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'ResourceNotFoundException':
+            error_msg = f"DynamoDB table not found: {DATA_TABLE}"
+            _get_client_error(status_logger, error_msg, reason=error_msg, data_table=DATA_TABLE)
+            raise RuntimeError(error_msg)
+        else:
+            raise
+
+
+def fetch_metadata_active_clients(table, status_logger: Optional[Any] = None):
+    """Fetch all active clients from pipeline-infos DynamoDB table.
+    
+    Uses scan with filter since the table may not have the ActiveClientsIndex GSI.
+    For production with large tables, consider adding the GSI for better performance.
+    """
+    try:
+        _get_client_info(
+            status_logger,
+            "Scanning pipeline-infos for active clients",
+            data_table=DATA_TABLE,
+            force=True,
+        )
+        # Scan with filter for active clients
+        # is_active can be 1, "1", True, "ACTIVE", or "active"
+        # Using scan instead of GSI query for compatibility with tables without GSI
+        response = table.scan()
+        all_items = response.get("Items", [])
+        
+        # Handle pagination if needed
+        while "LastEvaluatedKey" in response:
+            response = table.scan(
+                ExclusiveStartKey=response["LastEvaluatedKey"]
+            )
+            all_items.extend(response.get("Items", []))
+        
+        # Filter for active clients in Python
+        items = []
+        for item in all_items:
+            is_active = item.get('is_active')
+            # Check if active (is_active can be 1, "1", True, or "ACTIVE")
+            if is_active in [1, '1', True, 'ACTIVE', 'active']:
+                items.append(item)
+        
+        _get_client_info(
+            status_logger,
+            "Filtered active clients",
+            data_table=DATA_TABLE,
+            rows_returned=len(items),
+            total_scanned=len(all_items),
+            force=True,
+        )
+        return items
+    except Exception as e:
+        error_info = {
+            "stage": "fetch_active_clients",
+            "table": DATA_TABLE,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+        _get_client_error(
+            status_logger,
+            f"Error fetching active clients: {e}",
+            reason=str(e),
+            data_table=DATA_TABLE,
+        )
+        write_log_to_s3(error_info, status_logger)
+        raise RuntimeError(f"Error in fetching metadata from DynamoDB: {e}")
+
+
+def format_client_metadata(items, status_logger: Optional[Any] = None):
+    """Format pipeline-infos items for Step Function Map state."""
+    try:
+        clients = []
+        for item in items:
+            # Parse brand_retailer_key to extract brand_id and retailer_id
+            # CRITICAL: brand_retailer_key format is {brand_id}#{retailer_id}, not {brand_name}#{retailer_id}
+            brand_retailer_key = item.get("brand_retailer_key", "")
+            if "#" in brand_retailer_key:
+                brand_id, retailer_id = brand_retailer_key.split("#", 1)
+            else:
+                brand_id = item.get("brand_id", "")
+                retailer_id = item.get("retailer_id", "")
+            
+            # Use retailer_id from item if available, otherwise use parsed value
+            final_retailer_id = item.get("retailer_id", retailer_id)
+            
+            # National retailer is now supported with separate processing logic
+            # The data_transfer Lambda will detect National files and process them separately
+            # to prevent fan-out and drop retailer-specific columns appropriately
+            
+            client_info = {
+                "client_id": item.get("client_id"),
+                "client_name": item.get("client_name"),
+                "brand_id": item.get("brand_id", brand_id),  # Use split value as fallback
+                "brand_name": item.get("brand_name"),  # Always use DynamoDB value, no fallback
+                "retailer_id": final_retailer_id,
+                "retailer_name": item.get("retailer_name"),
+                "region": item.get("region", AWS_REGION),  # Default to Lambda region
+                "last_trained_date": item.get("last_trained_date"),
+                "next_training_due": item.get("next_training_due"),
+                "brand_retailer_key": brand_retailer_key  # Include for data_transfer Lambda
+            }
+            clients.append(client_info)
+        
+        _get_client_info(
+            status_logger,
+            "Formatted client metadata for Step Function",
+            rows_returned=len(clients),
+            force=True,
+        )
+        return clients
+    except Exception as e:
+        error_info = {
+            "stage": "format_clients",
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }
+        _get_client_error(
+            status_logger,
+            f"Error formatting client metadata: {e}",
+            reason=str(e),
+        )
+        write_log_to_s3(error_info, status_logger)
+        raise RuntimeError(f"Error in formatting client metadata: {e}")
+
+
+# ============================================================================
+# LAMBDA HANDLER
+# ============================================================================
+
+def lambda_handler(event, context):
+    """
+    Main Lambda handler.
+    
+    Input: Event from EventBridge or Step Function
+    Output: Dict with list of active clients and metadata
+    """
+    execution_id = getattr(context, "aws_request_id", None) or "local"
+    env_tag = os.environ.get("ENVIRONMENT", "dev")
+
+    run_log = {
+        "event": event,
+        "status": "started",
+        "timestamp": str(datetime.now(timezone.utc)),
+        "function": "mmm_dev_get_client",
+        "configuration": {
+            "data_table": DATA_TABLE,
+            "s3_log_bucket": S3_LOG_BUCKET,
+            "aws_region": AWS_REGION
+        }
+    }
+
+    # MikAura observability (pipeline-agnostic)
+    status_logger = None
+    metric_logger = None
+    if _MIKAURA_AVAILABLE:
+        _config = MikAuraObservabilityConfig(
+            context={"pipeline_context": "Data Ingestion Pipeline"},
+            environment=env_tag,
+            correlation_id=execution_id,
+        )
+        status_logger = MikAuraStatusLogger.from_config(
+            _config,
+            min_level=LOG_LEVEL,
+            allowed_statuses=set(GET_CLIENT_ALLOWED_STATUSES),
+        )
+        metric_logger = MikAuraMetricLogger.from_config(_config)
+
+    with ingestion_context(
+        use_case="get_active_clients",
+        pipeline_component="get_client_lambda",
+        execution_id=execution_id,
+        environment=env_tag,
+    ):
+        try:
+            _get_client_running(
+                status_logger,
+                "Starting mmm_dev_get_client Lambda execution",
+            )
+
+            table = validate_table_exists(status_logger)
+            items = fetch_metadata_active_clients(table, status_logger)
+
+            if not items:
+                _get_client_warning(
+                    status_logger,
+                    "No active clients found in metadata table",
+                    rows_returned=0,
+                )
+                run_log.update({
+                    "status": "no_active_clients",
+                    "rows_returned": 0,
+                    "message": "No active clients found in metadata table",
+                    "timestamp": str(datetime.now(timezone.utc))
+                })
+                write_log_to_s3(run_log, status_logger)
+                if metric_logger:
+                    metric_logger.increment("data_ingestion.get_client.outcome", extra_tags=["result:no_active_clients"])
+                elif _get_client_metrics:
+                    _get_client_metrics.increment(
+                        "data_ingestion.get_client.outcome",
+                        tags=[f"env:{env_tag}", "result:no_active_clients"],
+                    )
+                return {
+                    "clients": [],
+                    "status": "no_active_clients",
+                    "message": "No active clients found in metadata table",
+                    "rows_returned": 0,
+                    "timestamp": str(datetime.now(timezone.utc))
+                }
+
+            clients = format_client_metadata(items, status_logger)
+
+            run_log.update({
+                "status": "success",
+                "rows_returned": len(clients),
+                "timestamp": str(datetime.now(timezone.utc))
+            })
+
+            write_log_to_s3(run_log, status_logger)
+
+            _get_client_success(
+                status_logger,
+                f"Retrieved {len(clients)} active clients",
+                rows_returned=len(clients),
+            )
+            if metric_logger:
+                metric_logger.increment("data_ingestion.get_client.outcome", extra_tags=["result:success"])
+            elif _get_client_metrics:
+                _get_client_metrics.increment(
+                    "data_ingestion.get_client.outcome",
+                    tags=[f"env:{env_tag}", "result:success"],
+                )
+
+            return {
+                "clients": clients,
+                "status": "success",
+                "rows_returned": len(clients),
+                "timestamp": str(datetime.now(timezone.utc))
+            }
+
+        except Exception as e:
+            run_log.update({
+                "status": "failed",
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "timestamp": str(datetime.now(timezone.utc))
+            })
+
+            write_log_to_s3(run_log, status_logger)
+
+            _get_client_exception(status_logger, "Lambda execution failed", e)
+            if metric_logger:
+                metric_logger.increment("data_ingestion.get_client.outcome", extra_tags=["result:failed"])
+            elif _get_client_metrics:
+                _get_client_metrics.increment(
+                    "data_ingestion.get_client.outcome",
+                    tags=[f"env:{env_tag}", "result:failed"],
+                )
+
+            raise RuntimeError(f"Lambda execution failed: {e}")
