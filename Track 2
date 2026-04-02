@@ -1,14 +1,21 @@
-Track 2: Migrate Helper to MikAura (Logging Path) 📊
-Priority: MEDIUM | Effort: 2-3 days | Risk: Medium
+Adding data staleness validators which are channel specific
 
-Fix Root Cause A:
 
-Add optional status_logger parameter to helper public methods
-Create _helper_info/warning/error wrappers (same pattern as Lambda)
-Convert 53 logger.* calls to use wrappers
-Pass status_logger=_mikaura_sl from all Lambda call sites
-Result:
 
-✅ Full MikAura compliance for helper module
-✅ Structured logging for all helper operations
-✅ Consistent observability across codebase
+Open
+
+
+Improve Story
+
+Key details
+Description
+
+Data staleness validator currently catch weekly rows and looking for missed week. we need to add some data validation based on channel staleness as well , and or sales data.
+
+1-if a media channel is null , or impresion is null/negative or not float or int
+
+2-must be looged and sent to data dog
+
+3-Sale dat is a must so if it is missing in updated row, data must not be ingested and must send an alerts to both data dog and slack.
+
+4-also if channel dta is missing must not ingest and only send logs
