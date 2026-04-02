@@ -1,9 +1,3 @@
-11.Completed the implementation of the KPI Behaviour Data Drift alert, but identified an issue where the alert was triggering even with non-anomalous data. Worked on debugging and fixing the issue. Due to this, the call with Seema could not be scheduled and will be planned once the issue is resolved.
-24.Strengthened observability framework by implementing client, brand, and retailer-level metrics for enhanced insights
-25.Working on the Mikaura logger class and MikauraMetrics utility class.
-26.Refactored Mikaura utility to a fully agnostic, immutable factory pattern, replacing global singletons with fresh instances to prevent shared state issues.
+Right now, the high priority is to add "actual_brand_entity_id" and the country code to both pipeline info and client metadata to unblock the DS team.
 
-Decoupled pipeline-specific logic by removing hardcoded statuses/fields and implementing normalized, scoped context via non-mutating with_context() calls.
-27.improved the utility aura class and also data ingestion dashboard
-30.Working on removing the inbuilt Python logger class, use the mikaura logger. in all code and also working on VIP S3 Bucket Auto-Provisioning on Client Onboarding
-31.Stared working on the ticket. ME-5083
+Could you please let me know what value should be stored in "actual_brand_entity_id"? After that, I’ll work on the MikAura logger as well. It’s a small task, and I’ll try to complete it today.
