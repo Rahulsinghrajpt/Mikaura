@@ -1,0 +1,269 @@
+def _is_channel_metric_column(normalized_name: str) -> bool:
+    """True if column is a media or retailer spend/impressions metric (not sales/date)."""
+    if not normalized_name:
+        return False
+    if normalized_name == "sales" or normalized_name.endswith("_sales"):
+        return False
+    if normalized_name.endswith("_impressions") or normalized_name.endswith("_spend"):
+        return True
+    return False
+
+
+def _channel_column_pairs(
+    df_columns_normalized: List[str], original_columns: List[str]
+) -> List[Tuple[str, str]]:
+    """Return list of (normalized_name, original_header) for channel metric columns."""
+    pairs: List[Tuple[str, str]] = []
+    for i, col_norm in enumerate(df_columns_normalized):
+        if _is_channel_metric_column(col_norm):
+            pairs.append((col_norm, original_columns[i]))
+    return pairs
+
+
+def validate_channel_data(
+    df: pd.DataFrame,
+    df_columns_normalized: List[str],
+    original_columns: List[str],
+    status_logger: Optional[Any] = None,
+) -> Tuple[bool, bool, Dict[str, Any]]:
+    """
+    Validate media/retailer channel impressions and spend columns.
+
+    Returns:
+        has_quality_issues: True if any present channel cell is null (partial), negative, or non-numeric.
+        is_channel_missing: True if there is no usable impression data (no *_impressions columns,
+            or every *_impressions column is entirely null/empty).
+        details: dict with missing_channels, quality_issues, impression_columns_checked, etc.
+    """
+    details: Dict[str, Any] = {
+        "missing_channels": [],
+        "quality_issues": [],
+        "impression_columns": [],
+    }
+    pairs = _channel_column_pairs(df_columns_normalized, original_columns)
+    impression_pairs = [(n, o) for n, o in pairs if n.endswith("_impressions")]
+    spend_pairs = [(n, o) for n, o in pairs if n.endswith("_spend")]
+
+    _transfer_info(
+        status_logger,
+        f"Starting channel data validation: {len(impression_pairs)} impression col(s), {len(spend_pairs)} spend col(s)",
+        debug_event="channel_validation",
+    )
+
+    # No impression columns at all -> missing channel data
+    if not impression_pairs:
+        details["missing_channels"].append(
+            {"reason": "no_impressions_columns", "message": "No *_impressions columns in file"}
+        )
+        _transfer_error(
+            status_logger,
+            "CHANNEL VALIDATION FAILED: No *_impressions columns found in file",
+            reason="channel_data_missing",
+            debug_event="channel_validation",
+        )
+        return False, True, details
+
+    has_quality_issues = False
+    is_channel_missing = False
+
+    def analyze_metric_column(original_col: str, col_norm: str, kind: str) -> None:
+        nonlocal has_quality_issues, is_channel_missing
+        if original_col not in df.columns:
+            return
+        col_data = df[original_col]
+        n = len(df)
+        null_mask = col_data.isna() | col_data.isnull()
+        try:
+            empty_mask = col_data.astype(str).str.strip() == ""
+        except Exception:
+            empty_mask = pd.Series([False] * n, index=df.index)
+        blank_mask = null_mask | empty_mask
+        coerced = pd.to_numeric(col_data, errors="coerce")
+        had_value = ~blank_mask
+        non_numeric_mask = had_value & coerced.isna()
+        negative_mask = coerced.notna() & (coerced < 0)
+        # Some rows blank but not all -> quality (partial null)
+        partial_null_mask = (
+            blank_mask
+            if (n > 0 and blank_mask.any() and not bool(blank_mask.all()))
+            else pd.Series([False] * n, index=df.index)
+        )
+
+        if kind == "impressions" and n > 0 and bool(blank_mask.all()):
+            is_channel_missing = True
+            details["missing_channels"].append(
+                {
+                    "column": original_col,
+                    "normalized": col_norm,
+                    "reason": "all_null_or_empty",
+                }
+            )
+            _transfer_error(
+                status_logger,
+                f"CHANNEL DATA MISSING: Impressions column '{original_col}' is entirely null/empty",
+                reason="channel_impressions_all_null",
+                column=original_col,
+                debug_event="channel_validation",
+            )
+            return
+
+        if kind == "spend" and n > 0 and bool(blank_mask.all()):
+            has_quality_issues = True
+            details["quality_issues"].append(
+                {
+                    "column": original_col,
+                    "normalized": col_norm,
+                    "kind": kind,
+                    "partial_null_count": 0,
+                    "non_numeric_count": 0,
+                    "negative_count": 0,
+                    "all_null_or_empty": True,
+                    "sample_row_indices": [],
+                }
+            )
+            _transfer_warning(
+                status_logger,
+                f"Channel quality issue: spend column '{original_col}' is entirely null/empty (ingestion continues)",
+                debug_event="channel_validation",
+                column=original_col,
+            )
+            return
+
+        if partial_null_mask.any() or non_numeric_mask.any() or negative_mask.any():
+            has_quality_issues = True
+            bad_idx = df.index[partial_null_mask | non_numeric_mask | negative_mask].tolist()
+            issue = {
+                "column": original_col,
+                "normalized": col_norm,
+                "kind": kind,
+                "partial_null_count": int(partial_null_mask.sum()),
+                "non_numeric_count": int(non_numeric_mask.sum()),
+                "negative_count": int(negative_mask.sum()),
+                "sample_row_indices": bad_idx[:20],
+            }
+            details["quality_issues"].append(issue)
+            _transfer_warning(
+                status_logger,
+                f"Channel quality issue in '{original_col}' ({kind}): "
+                f"partial_null={issue['partial_null_count']}, non_numeric={issue['non_numeric_count']}, "
+                f"negative={issue['negative_count']}",
+                debug_event="channel_validation",
+                column=original_col,
+            )
+
+    for col_norm, original_col in impression_pairs:
+        details["impression_columns"].append(original_col)
+        analyze_metric_column(original_col, col_norm, "impressions")
+
+    for col_norm, original_col in spend_pairs:
+        analyze_metric_column(original_col, col_norm, "spend")
+
+    if not is_channel_missing and not has_quality_issues:
+        _transfer_info(
+            status_logger,
+            "Channel data validation PASSED: impression/spend metrics are present and consistent",
+            debug_event="channel_validation",
+        )
+    elif has_quality_issues and not is_channel_missing:
+        _transfer_info(
+            status_logger,
+            "Channel data validation: quality issues logged (ingestion continues)",
+            debug_event="channel_validation",
+        )
+
+    return has_quality_issues, is_channel_missing, details
+
+
+def _emit_validation_metric(metric_name: str, status_logger: Optional[Any] = None) -> None:
+    """Emit DogStatsD counter for Datadog (Lambda extension)."""
+    try:
+        if _pipeline_metrics:
+            _pipeline_metrics.increment(metric_name, tags=[f"env:{ENVIRONMENT}"])
+    except Exception as exc:
+        _transfer_warning(
+            status_logger,
+            f"Failed to emit metric {metric_name}: {exc}",
+            debug_event="metrics",
+        )
+
+
+def send_missing_channel_alert(
+    client_id: str,
+    brand_name: str,
+    retailer_id: str,
+    filename: str,
+    missing_channels: List[Dict[str, Any]],
+    quality_issues: List[Dict[str, Any]],
+    total_rows: int,
+    status_logger: Optional[Any] = None,
+) -> bool:
+    """
+    Send Slack alert when file ingestion is skipped due to missing channel (impression) data.
+    """
+    if not missing_channels:
+        return True
+    try:
+
+        def convert_to_native_types(obj: Any) -> Any:
+            if isinstance(obj, dict):
+                return {k: convert_to_native_types(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [convert_to_native_types(item) for item in obj]
+            if hasattr(obj, "item"):
+                return obj.item()
+            if isinstance(obj, (int, float, str, bool)) or obj is None:
+                return obj
+            try:
+                if hasattr(obj, "dtype"):
+                    if "int" in str(obj.dtype):
+                        return int(obj)
+                    if "float" in str(obj.dtype):
+                        return float(obj)
+                    return int(obj)
+            except (ValueError, TypeError, AttributeError):
+                pass
+            try:
+                return str(obj)
+            except Exception:
+                return repr(obj)
+
+        payload = {
+            "alert_type": "MISSING_CHANNEL_DATA",
+            "client_id": client_id,
+            "brand_name": brand_name,
+            "retailer_id": retailer_id,
+            "filename": filename,
+            "missing_channels": convert_to_native_types(missing_channels),
+            "quality_issues": convert_to_native_types(quality_issues),
+            "total_rows": int(total_rows),
+            "message": (
+                f"File ingestion skipped: missing channel data. "
+                f"{len(missing_channels)} issue(s) reported."
+            ),
+        }
+        response = lambda_client.invoke(
+            FunctionName=SLACK_LAMBDA_NAME,
+            InvocationType="Event",
+            Payload=json.dumps(payload, default=str),
+        )
+        if response.get("StatusCode") == 202:
+            _transfer_info(
+                status_logger,
+                f"Missing channel data alert sent for {client_id}/{brand_name}/{retailer_id}: {filename}",
+                alert_type="MISSING_CHANNEL_DATA",
+            )
+            return True
+        _transfer_warning(
+            status_logger,
+            f"Missing channel alert may have failed: StatusCode={response.get('StatusCode')}",
+            alert_type="MISSING_CHANNEL_DATA",
+        )
+        return False
+    except Exception as e:
+        _transfer_warning(
+            status_logger,
+            f"Failed to send missing channel alert: {e}",
+            alert_type="MISSING_CHANNEL_DATA",
+        )
+        return False
+
