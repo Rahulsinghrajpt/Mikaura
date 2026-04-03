@@ -1,0 +1,26 @@
+[5:10 pm, 3/4/2026] Anshul Awasthi: [Component: Data Transfer Lambda]
+Remove standard library logging initialization and fallback mechanisms.
+
+[MODIFY] 
+lambda_function.py
+Remove import logging.
+Remove get_context_logger import and instantiation (logger = get_context_logger(_name_)).
+Update transfer* wrappers:
+If status_logger is provided, call MikAura.
+If status_logger is missing, silently pass (or print() if it's a critical error) instead of falling back to standard logger.
+Replace module-level import-time logger.warning/error calls with print() (which natively routes to AWS CloudWatch in Lambda without needing the logging module).
+[5:10 pm, 3/4/2026] Anshul Awasthi: [Component: Shared Utilities / Helpers]
+Make all shared utilities strictly require MikAura or silently pass (no standard logging fallback).
+
+[MODIFY] 
+pipeline_info_helper.py
+Remove import logging entirely.
+Update helper* wrappers to remove the else: logger.* branches. If status_logger is missing, default to doing nothing.
+[MODIFY] 
+tracer_file_finder.py
+Remove import logging and logger = logging.getLogger(...).
+Update finder* wrappers to strip out logger.* fallbacks.
+[MODIFY] 
+s3_utils.py
+Remove fallback _logger = get_context_logger(...) and import logging references.
+Update vip* wrappers to strip out _logger.* fallbacks.
