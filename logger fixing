@@ -1,26 +1,113 @@
-[5:10 pm, 3/4/2026] Anshul Awasthi: [Component: Data Transfer Lambda]
-Remove standard library logging initialization and fallback mechanisms.
+import os
+import ast
+import re
+import sys
+from pathlib import Path
 
-[MODIFY] 
-lambda_function.py
-Remove import logging.
-Remove get_context_logger import and instantiation (logger = get_context_logger(_name_)).
-Update transfer* wrappers:
-If status_logger is provided, call MikAura.
-If status_logger is missing, silently pass (or print() if it's a critical error) instead of falling back to standard logger.
-Replace module-level import-time logger.warning/error calls with print() (which natively routes to AWS CloudWatch in Lambda without needing the logging module).
-[5:10 pm, 3/4/2026] Anshul Awasthi: [Component: Shared Utilities / Helpers]
-Make all shared utilities strictly require MikAura or silently pass (no standard logging fallback).
+# --- Configuration ---
+ROOT_DIR = Path(__file__).parent.parent
+# List of directories to scan
+SCAN_DIRS = [ROOT_DIR / "src", ROOT_DIR / "lambdas"]
 
-[MODIFY] 
-pipeline_info_helper.py
-Remove import logging entirely.
-Update helper* wrappers to remove the else: logger.* branches. If status_logger is missing, default to doing nothing.
-[MODIFY] 
-tracer_file_finder.py
-Remove import logging and logger = logging.getLogger(...).
-Update finder* wrappers to strip out logger.* fallbacks.
-[MODIFY] 
-s3_utils.py
-Remove fallback _logger = get_context_logger(...) and import logging references.
-Update vip* wrappers to strip out _logger.* fallbacks.
+# Files that are allowed to import or use the standard library `logging` module natively
+LOGGING_ALLOWLIST = {
+    ROOT_DIR / "src" / "utils" / "context_logger.py",
+    ROOT_DIR / "src" / "utils" / "logging_helper.py",
+    # MIKAura itself needs to delegate to a base logger mechanism under the hood
+    ROOT_DIR / "src" / "utils" / "mikaura_observability.py",
+}
+
+class ObservabilityComplianceEvaluator:
+    def __init__(self):
+        self.failures = []
+        self.files_scanned = 0
+
+    def add_failure(self, filepath, line_no, message):
+        self.failures.append(f"[{filepath.relative_to(ROOT_DIR)}:{line_no}] {message}")
+
+    def evaluate_file(self, filepath: Path):
+        self.files_scanned += 1
+        with open(filepath, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        is_allowed = filepath in LOGGING_ALLOWLIST
+
+        try:
+            tree = ast.parse(content, filename=str(filepath))
+        except SyntaxError:
+            return  # Skip files with syntax errors
+
+        # Check 1: No standard `logging` imports outside allowlist
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == 'logging' and not is_allowed:
+                        self.add_failure(filepath, node.lineno, "Violation: Found 'import logging' outside of fundamental observability infrastructure.")
+            elif isinstance(node, ast.ImportFrom):
+                if node.module == 'logging' and not is_allowed:
+                    self.add_failure(filepath, node.lineno, "Violation: Found 'from logging import ...' outside of fundamental observability infrastructure.")
+                
+                # Check 2: No context_logger imports either, we should enforce MikAura strictly
+                if (node.module and 'context_logger' in node.module) and not is_allowed:
+                    self.add_failure(filepath, node.lineno, "Violation: Found import of legacy 'context_logger'. Must use MikAura observability.")
+
+        # Check 3: Raw regex search for leftover logger.* calls in non-allowed paths
+        if not is_allowed:
+            lines = content.split('\n')
+            for i, line in enumerate(lines, 1):
+                # Ignore comments
+                clean_line = line.split('#')[0]
+                
+                # Looking for self.logger.xxx or logger.xxx (except status_logger)
+                if re.search(r'(?<!status_)(?<!_)logger\.(info|debug|warning|error|exception)\(', clean_line):
+                    self.add_failure(filepath, i, "Violation: Found standard logger call. Must use MikAura status_logger.log_* exclusively.")
+
+    def evaluate_mikaura_internals(self):
+        """Specifically evaluate mikaura_observability.py matches client expectations."""
+        mikaura_path = ROOT_DIR / "src" / "utils" / "mikaura_observability.py"
+        if not mikaura_path.exists():
+            self.failures.append(f"[Global] Missing {mikaura_path.name}")
+            return
+
+        with open(mikaura_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # Check that with_context returns a NEW instance, not returning self (no mutated singleton)
+        if "def with_context(self" in content:
+            if "return self" in content and "def with_context" in content:
+                 self.failures.append("[MikAura] Violation: 'with_context' seems to mutate shared state or return 'self'. It must yield a scoped/fresh logger.")
+
+    def run(self):
+        print(f"Starting Observability Compliance Scan on {ROOT_DIR}...\n")
+        
+        # Evaluate standard implementations
+        for scan_dir in SCAN_DIRS:
+            if not scan_dir.exists():
+                print(f"Warning: Directory {scan_dir} does not exist.")
+                continue
+                
+            for filepath in scan_dir.rglob("*.py"):
+                # Skip .venv, node_modules etc if any sneak in
+                if ".venv" in filepath.parts or "node_modules" in filepath.parts:
+                    continue
+                self.evaluate_file(filepath)
+
+        # Evaluate MikAura specific requirements
+        self.evaluate_mikaura_internals()
+
+        # Report Results
+        print("="*60)
+        print(f"Scan Complete. Evaluated {self.files_scanned} files.")
+        if not self.failures:
+            print("Status: PASSED")
+            print("No compliance failures found. MikAura is strictly enforced!")
+        else:
+            print("Status: FAILED")
+            print(f"Found {len(self.failures)} compliance violations:\n")
+            for fail in self.failures:
+                print(f"  ❌ {fail}")
+            sys.exit(1)
+
+if __name__ == "__main__":
+    evaluator = ObservabilityComplianceEvaluator()
+    evaluator.run()
