@@ -1,0 +1,57 @@
+# Aura Lambda deployment via Serverless Framework
+
+# Why migrate to Serverless Framework
+
+Our Lambdas were previously deployed using the **AWS CLI zip method** (package code, upload zip, update function). Migrating to the **Serverless Framework** gives us a standard, repeatable way to define, deploy, and test Lambdas across environments.
+
+## What is Serverless?
+
+**Serverless** (Serverless Framework) is an open-source tool that lets you define and deploy serverless applications (e.g. AWS Lambda) using a declarative config file. You describe functions, resources, and environment in YAML; the framework handles packaging, deployment, and wiring to AWS.
+
+## Why we are using it
+
+- **Single source of truth** — Each Lambda is defined in a `serverless.yml` in its folder (e.g. `lambda/demo-node/serverless.yml`), so config lives next to code.
+- **Environment and stage support** — Stage (e.g. `qa`, `stg`, `prd`) and region are driven by config and branch, so deployments are consistent.
+- **Easy local testing** — We can run and test Lambdas locally (e.g. `serverless invoke local`) and run unit tests in `tests/lambda/<lambda-name>/` before deploying, improving quality and feedback.
+- **CI/CD alignment** — The same `serverless.yml` is used for validation and deployment in GitHub Actions, so what we test is what we deploy.
+
+---
+
+# 1. Serverless deployment and PR status check
+
+## Setup
+
+- **Per-Lambda config** — Each Lambda folder under `lambda/` can have a `serverless.yml` (or `serverless.yaml`) that defines the service name, provider (AWS, region, runtime, IAM role), and functions.
+- **Tests** — For each Lambda we add tests under `tests/lambda/<lambda-folder-name>/` (e.g. `tests/lambda/demo-node/`, `tests/lambda/demo-python/`). Tests can be Node (js) or Python (py).
+- **PR checks** — The workflow `.github/workflows/pr-status-checks.yaml` runs on pull requests when `lambda/**`, `tests/lambda/**`, or the workflow file changes. It runs only when there are Lambda or test changes.
+    - 
+
+## What the PR status check does
+
+1. **Serverless config validation** — For every `lambda/*/` folder that has a `serverless.yml` (or `serverless.yaml`), it runs `serverless print --stage <stage>` to validate the config. Stage and IAM role are derived from the PR base branch (e.g. `main` → prd, `staging` → stg, feature branch → qa).
+2. **Python tests** — Runs `pytest tests/lambda/` for all Python Lambda tests.
+3. **Node tests and lint** — Installs dependencies under `tests/`, runs lint (`npm run lint:ci`) and Jest for `tests/lambda/` (Node/TS tests).
+
+This way, **Lambdas are validated and tested before a PR is merged**, so only working, serverless-ready code goes into the deployment pipeline.
+
+---
+
+# 2. Lambdas migration
+
+## Naming convention
+
+- **Current:** `meridian-optimizer-invoker-<environment>` (and similar for other Lambdas).
+- **Proposed:** `meridian-optimizer-invoker-sls-<environment>` (add `-sls-` before the environment).
+
+**Why we need a new Lambda name**
+
+1. **Existing Lambdas can’t be removed** — They’re referenced by other resources (e.g. Spacelift stacks, event rules), so we can’t delete them.
+2. **Same name can’t be reused** — A Lambda with that name already exists in each environment, so we can’t create a new one with the same name; we use a new name (e.g. `-sls-<environment>`) and migrate in parallel.
+
+## Migration plan
+
+1. **Create new Lambdas with new naming** — Deploy each Lambda via Serverless using the new naming convention (e.g. `meridian-optimizer-invoker-sls-qa`, `meridian-optimizer-invoker-sls-stg`, `meridian-optimizer-invoker-sls-prd`). Ensure each has a `serverless.yml` in its folder and tests in `tests/lambda/<lambda-folder-name>/`.
+2. **Update Spacelift stacks** — After all new Lambdas are deployed and verified, update every Spacelift stack that references these Lambdas to point to the new function names (e.g. from `meridian-optimizer-invoker-qa` to `meridian-optimizer-invoker-sls-qa`).
+3. **Remove old Lambdas in phases** — Once Spacelift and all consumers use the new Lambdas, delete the old Lambdas (deployed via AWS CLI zip) in a controlled, phase-by-phase manner, manually, to avoid breaking dependencies.
+
+Keeping the migration in these three steps (create new → switch Spacelift → decommission old) keeps risk low and allows rollback by reverting Spacelift to the old names if needed.
