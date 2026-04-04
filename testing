@@ -1,143 +1,158 @@
-def reorder_columns_sot(
-    df, retailer_id: str, status_logger: Optional[Any] = None
-):
-    """
-    Reorder DataFrame columns to match SOT (Source of Truth) schema.
-    
-    TASK 5: Uses universal SOT from sot-files/walmart.csv as the base schema.
-    Output order: SOT columns first (exact order), then retailer-specific columns, then extras.
-    
-    Uses CASE-INSENSITIVE matching to handle column name variations.
-    Creates missing SOT columns with default values (0/NaN) if absent in source.
-    
-    Args:
-        df: DataFrame to reorder
-        retailer_id: Retailer identifier (e.g., 'walmart', 'amazon')
-    
-    Returns:
-        DataFrame with columns in SOT-first order, with missing SOT columns added
-    """
-    ordered_cols = []
-    
-    # TASK 5: Universal SOT schema from walmart.csv (remove retailer-specific columns)
-    # Order: Date, Sales, In_stock_Rate, GQV, OOH_impressions, OOH_spend,
-    #        PaidSocial_impressions, PaidSocial_spend, TV_impressions, TV_spend, Promo_flag
-    universal_sot_cols = [
-        'Date', 'Sales', 'In_stock_Rate', 'GQV',
-        'Promo_flag'
-    ]
-    
-    # Create case-insensitive lookup map: normalized -> actual column name
-    df_cols_normalized_map = {normalize_header_for_matching(col): col for col in df.columns}
-    df_cols_normalized = set(df_cols_normalized_map.keys())
-    
-    # Known media channel prefixes (to exclude from retailer detection)
-    media_channels_lower = {
-        'ooh_impressions', 'ooh_spend',
-        'paidsocial_impressions', 'paidsocial_spend',
-        'tv_impressions', 'tv_spend'
-    }
-    
-    # Track missing SOT columns to add with defaults
-    missing_sot_cols = []
-    
-    # TASK 5: Add SOT columns in exact order (if they exist in DataFrame)
-    for sot_col in universal_sot_cols:
-        sot_col_normalized = normalize_header_for_matching(sot_col)
-        if sot_col_normalized in df_cols_normalized:
-            actual_col = df_cols_normalized_map[sot_col_normalized]
-            ordered_cols.append(actual_col)
-        else:
-            # SOT column missing - will add with default value
-            missing_sot_cols.append(sot_col)
-    
-    # TASK 5: Add missing SOT columns with default values (0 for numeric, '' for text)
-    for missing_col in missing_sot_cols:
-        if missing_col == 'Promo_flag':
-            df[missing_col] = ''  # Text column
-        elif missing_col == 'Date':
-            # Date should already exist (renamed from Week), but if missing, use empty string
-            df[missing_col] = ''
-        else:
-            df[missing_col] = 0  # Numeric columns default to 0
-        ordered_cols.append(missing_col)
-        _transfer_info(
-            status_logger,
-            f"TASK 5: Added missing SOT column '{missing_col}' with default value",
-            missing_sot_column=missing_col,
-            retailer_id=retailer_id,
-        )
-    
-    # Add retailer-specific columns (spend before impressions)
-    # Find ANY retailer-specific spend/impressions columns
-    # Pattern: {Retailer}_spend, {Retailer}_impressions
-    # Exclude media channel columns (case-insensitive check)
-    retailer_spend_cols = []
-    retailer_impressions_cols = []
-    
-    for col in df.columns:
-        col_normalized = normalize_header_for_matching(col)
-        if col_normalized.endswith('_spend') and col_normalized not in media_channels_lower:
-            retailer_spend_cols.append(col)
-        elif (
-            col_normalized.endswith('_impressions') or col_normalized.endswith('_impression')
-        ) and col_normalized not in media_channels_lower:
-            retailer_impressions_cols.append(col)
-    
-    # FIX #3: LOG: Track retailer column detection
-    _transfer_debug(
-        status_logger,
-        "column_ordering",
-        f"reorder_columns_sot: Found {len(retailer_spend_cols)} retailer spend cols: {retailer_spend_cols}",
-        retailer_id=retailer_id,
-        retailer_spend_cols=retailer_spend_cols,
-    )
-    _transfer_debug(
-        status_logger,
-        "column_ordering",
-        f"reorder_columns_sot: Found {len(retailer_impressions_cols)} retailer impressions cols: {retailer_impressions_cols}",
-        retailer_id=retailer_id,
-        retailer_impressions_cols=retailer_impressions_cols,
-    )
+Refactor the existing drift detection logic in the Lambda to REMOVE dependency on any static `profile.json` and instead compute all drift metrics dynamically from the incoming dataset.
 
-    # Add retailer-specific columns in order (spend before impressions)
-    for col in retailer_spend_cols:
-        if col not in ordered_cols:
-            ordered_cols.append(col)
-            _transfer_debug(
-                status_logger,
-                "column_ordering",
-                f"reorder_columns_sot: Added retailer spend column '{col}'",
-                retailer_id=retailer_id,
-                column=col,
-            )
-    for col in retailer_impressions_cols:
-        if col not in ordered_cols:
-            ordered_cols.append(col)
-            _transfer_debug(
-                status_logger,
-                "column_ordering",
-                f"reorder_columns_sot: Added retailer impressions column '{col}'",
-                retailer_id=retailer_id,
-                column=col,
-            )
+### Objective
 
-    # Add any remaining columns not in the schema (preserve extras)
-    for col in df.columns:
-        if col not in ordered_cols:
-            ordered_cols.append(col)
-            _transfer_debug(
-                status_logger,
-                "column_ordering",
-                f"Added extra column '{col}' to output (not in SOT schema)",
-                retailer_id=retailer_id,
-                column=col,
-            )
-    
-    # STEP 6: Ensure Promo_flag remains last (even when extras exist)
-    # This maintains the contract that Promo_flag is always the last column
-    if 'Promo_flag' in ordered_cols:
-        ordered_cols.remove('Promo_flag')
-    ordered_cols.append('Promo_flag')  # Always last
-    
-    return df[ordered_cols]
+The system should NOT load or rely on any precomputed drift profile. Instead, it must:
+
+1. Use the incoming retailer dataset (CSV) as the source of truth
+2. Compute historical baselines from the dataset itself
+3. Compare the latest row against historical data to detect drift
+
+---
+
+### Required Changes
+
+#### 1. Remove profile usage
+
+* Remove or disable:
+
+  * `load_drift_profile()`
+  * Any usage of `profile`, `spend_stats`, `residual_profile`, or `thresholds` from JSON
+* Ensure no dependency on `profile.json` remains
+
+---
+
+#### 2. Split dataset into historical and latest
+
+After reading the CSV:
+
+```python
+df = pd.read_csv(file_path)
+df = df.sort_values("date")
+
+historical_df = df.iloc[:-1]
+latest_row = df.iloc[-1]
+```
+
+Add guard:
+
+* If `len(df) < 10`, skip drift detection
+
+---
+
+#### 3. Implement Spend Drift Detection (ME-5401 equivalent)
+
+For each spend column:
+
+```python
+mean = historical_df[col].mean()
+std = historical_df[col].std()
+
+if std is None or std == 0:
+    continue
+
+z_score = (latest_row[col] - mean) / std
+```
+
+Trigger:
+
+* YELLOW if `abs(z_score) >= 3`
+* RED if `abs(z_score) >= 4`
+
+Return:
+
+* channel
+* value
+* mean
+* std
+* z_score
+* severity
+
+---
+
+#### 4. Implement KPI Drift Detection (ME-5402 equivalent)
+
+Train a regression model dynamically:
+
+```python
+X = historical_df[feature_cols]
+y = np.log1p(historical_df[kpi_col])
+
+model = LinearRegression()
+model.fit(X, y)
+```
+
+Predict for latest row:
+
+```python
+pred = model.predict([latest_row[feature_cols].values])[0]
+actual = np.log1p(latest_row[kpi_col])
+
+residual = actual - pred
+```
+
+Compute residual z-score:
+
+```python
+pred_hist = model.predict(X)
+residuals = y - pred_hist
+
+resid_std = residuals.std()
+resid_z = residual / resid_std if resid_std > 0 else 0
+```
+
+Trigger:
+
+* YELLOW if `abs(resid_z) >= 3`
+* RED if `abs(resid_z) >= 4`
+
+---
+
+#### 5. Data Safety
+
+Add:
+
+* Drop NA values in historical_df
+* Skip columns with zero variance
+* Ensure feature_cols exist in dataframe
+* Handle exceptions safely (do not break pipeline)
+
+---
+
+#### 6. Integration
+
+Replace existing drift calls with:
+
+```python
+spend_anomalies = detect_spend_drift(historical_df, latest_row, spend_cols)
+kpi_anomaly = detect_kpi_drift(historical_df, latest_row, feature_cols, kpi_col)
+```
+
+If anomalies exist:
+
+* Trigger existing alert mechanism (Slack or logs)
+* Maintain same payload structure as much as possible
+
+---
+
+#### 7. Do NOT change
+
+* S3 upload logic
+* Lambda handler structure
+* Alert sending functions (reuse them)
+
+---
+
+### Goal Outcome
+
+* Drift detection becomes retailer-specific and data-driven
+* No dependency on static profile files
+* Works correctly for any incoming dataset
+
+---
+
+### Notes
+
+* Keep code clean, modular, and production-safe
+* Prefer small helper functions for readability
+* Maintain backward compatibility in alert format
