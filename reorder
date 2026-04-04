@@ -1,0 +1,156 @@
+            
+            # TASK 6: Use normalized source columns captured before retailer loop
+            # This was captured after date normalization but before retailer column selection
+            normalized_source_cols = normalized_source_cols_for_drift
+            
+            # Reorder columns to match SOT schema
+            retailer_df = reorder_columns_sot(
+                retailer_df, retailer_id, status_logger=status_logger
+            )
+            
+            # DIAG[7]: Log ACTUAL columns being written (after reorder) - critical for debugging
+            _transfer_debug(
+                status_logger,
+                "retailer_split",
+                f"DIAG[7]: FINAL columns for '{retailer_id}' ({len(retailer_df.columns)}): {retailer_df.columns.tolist()}",
+                retailer_id=retailer_id,
+            )
+            
+            # ============================================================================
+            # TASK 6: SCHEMA DRIFT DETECTION: Classify missing columns
+            # ============================================================================
+            # Universal SOT schema (same as in reorder_columns_sot)
+            universal_sot_cols = [
+                'Date', 'Sales', 'In_stock_Rate', 'GQV',
+                'OOH_impressions', 'OOH_spend',
+                'PaidSocial_impressions', 'PaidSocial_spend',
+                'TV_impressions', 'TV_spend',
+                'Promo_flag'
+            ]
+            
+            # Normalize SOT columns for comparison
+            sot_cols_normalized = {normalize_header_for_matching(col) for col in universal_sot_cols}
+            
+            # Normalize output columns (after reorder)
+            normalized_output_cols = {normalize_header_for_matching(col) for col in retailer_df.columns}
+            
+            # TASK 6: Classify missing SOT columns into two sets
+            missing_in_source = []  # SOT col not present in normalized source columns
+            dropped_by_transform = []  # SOT col present in source but missing in output
+            
+            for sot_col in universal_sot_cols:
+                sot_col_normalized = normalize_header_for_matching(sot_col)
+                if sot_col_normalized not in normalized_output_cols:
+                    # Missing in output - check if it was in source
+                    if sot_col_normalized not in normalized_source_cols:
+                        missing_in_source.append(sot_col)
+                    else:
+                        dropped_by_transform.append(sot_col)
+            
+            # Find extra columns (in output but not in SOT - excluding retailer-specific)
+            retailer_prefixes = [f"{retailer_id.lower()}_", f"{retailer_id.capitalize().lower()}_"]
+            extra_cols = [
+                col for col in retailer_df.columns 
+                if normalize_header_for_matching(col) not in sot_cols_normalized
+                and not any(normalize_header_for_matching(col).startswith(prefix) for prefix in retailer_prefixes)
+                and not normalize_header_for_matching(col).endswith('_spend')  # Exclude retailer spend
+                and not (
+                    normalize_header_for_matching(col).endswith('_impressions')
+                    or normalize_header_for_matching(col).endswith('_impression')
+                )  # Exclude retailer impressions (plural or singular)
+            ]
+            
+            # Send Slack alert if schema drift detected
+            if missing_in_source or dropped_by_transform or extra_cols:
+                _transfer_warning(
+                    status_logger,
+                    f"SCHEMA DRIFT for {client_id}/{brand_name}/{retailer_id}: "
+                    f"Missing in source: {missing_in_source}, "
+                    f"Dropped by transform: {dropped_by_transform}, "
+                    f"Extra columns: {extra_cols}",
+                    client_id=client_id,
+                    brand_name=brand_name,
+                    retailer_id=retailer_id,
+                    debug_event="schema_drift",
+                )
+                # Send async Slack alert with classification
+                send_schema_drift_alert(
+                    client_id=client_id,
+                    brand_name=brand_name,
+                    retailer_id=retailer_id,
+                    missing_columns=missing_in_source + dropped_by_transform,  # Combined for backward compatibility
+                    missing_in_source=missing_in_source,  # TASK 6: New classification
+                    dropped_by_transform=dropped_by_transform,  # TASK 6: New classification
+                    extra_columns=extra_cols,
+                    filename=f"{client_id}_{brand_name}_{retailer_id}",  # Constructed filename
+                    status_logger=status_logger,
+                )
+            
+            # Verify critical columns exist after reordering (legacy check)
+            critical_cols = ['Sales', 'In_stock_Rate', 'Promo_flag']
+            missing_critical = [c for c in critical_cols if normalize_header_for_matching(c) not in normalized_output_cols]
+            if missing_critical:
+                _transfer_error(
+                    status_logger,
+                    f"CRITICAL: Missing expected columns after reorder for {retailer_id}: {missing_critical}",
+                    reason="missing_critical_after_reorder",
+                    retailer_id=retailer_id,
+                    missing_critical=missing_critical,
+                )
+            
+            # STEP 8 & 9: Send column drop alert if columns were dropped
+            if dropped_columns:
+                _transfer_warning(
+                    status_logger,
+                    f"STEP 8: {len(dropped_columns)} columns dropped for '{retailer_id}': {[dc['column'] for dc in dropped_columns]}",
+                    retailer_id=retailer_id,
+                    debug_event="column_drop",
+                )
+                
+                # Send Slack alert
+                if filename:
+                    send_column_drop_alert(
+                        client_id=client_id,
+                        brand_name=brand_name,
+                        retailer_id=retailer_id,
+                        filename=filename,
+                        dropped_columns=dropped_columns,
+                        total_source_columns=len(df.columns),
+                        total_output_columns=len(retailer_df.columns),
+                        status_logger=status_logger,
+                    )
+            
+            # Data integrity validation: Ensure minimum column count to prevent data loss
+            MIN_RETAILER_COLUMNS = 5  # Date, Sales, + at least 3 metrics
+            if len(retailer_df.columns) < MIN_RETAILER_COLUMNS:
+                _transfer_error(
+                    status_logger,
+                    f"CRITICAL: Output for {retailer_id} has only {len(retailer_df.columns)} columns. "
+                    f"Expected at least {MIN_RETAILER_COLUMNS}. Columns: {list(retailer_df.columns)}. "
+                    f"Aborting to prevent data loss.",
+                    reason="min_retailer_columns",
+                    retailer_id=retailer_id,
+                    column_count=len(retailer_df.columns),
+                )
+                continue  # Skip this retailer to prevent corrupted output
+            
+            # Convert to CSV bytes
+            output_buffer = io.BytesIO()
+            retailer_df.to_csv(output_buffer, index=False)
+            csv_bytes = output_buffer.getvalue()
+            
+            result[retailer_id] = csv_bytes
+            _transfer_info(
+                status_logger,
+                f"Created retailer file for {retailer_id}: {len(retailer_df)} rows, {len(retailer_df.columns)} columns",
+                retailer_id=retailer_id,
+                row_count=len(retailer_df),
+                column_count=len(retailer_df.columns),
+                debug_event="retailer_split",
+            )
+        
+        return result
+        
+    except Exception as e:
+        _transfer_exception(status_logger, "Error processing with pandas", e, debug_event="process_with_pandas")
+        return {}
