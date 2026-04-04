@@ -1,0 +1,108 @@
+Update the data ingestion pipeline to retain the FULL SOT schema for validation but completely disable column injection.
+
+---
+
+### 1. Define a SINGLE shared SOT constant
+
+Create a global constant and use it everywhere:
+
+UNIVERSAL_SOT_COLS = [
+'Date', 'Sales', 'In_stock_Rate', 'GQV',
+'OOH_impressions', 'OOH_spend',
+'PaidSocial_impressions', 'PaidSocial_spend',
+'TV_impressions', 'TV_spend',
+'Promo_flag'
+]
+
+Ensure this is the ONLY SOT definition used across the codebase.
+
+---
+
+### 2. Update `reorder_columns_sot`
+
+Modify behavior as follows:
+
+* DO NOT add any missing SOT columns.
+* Remove logic that fills missing columns with 0 or ''.
+* Only include SOT columns IF they exist in the DataFrame.
+* Preserve all existing columns.
+* Maintain ordering:
+
+  1. SOT columns (only those present in df)
+  2. retailer-specific columns (_spend first, then _impressions/_impression)
+  3. remaining extra columns
+* Keep `Promo_flag` as the last column ONLY if it exists.
+* Add debug logs when SOT columns are missing, but do NOT create them.
+
+---
+
+### 3. Update Schema Drift Logic (TASK 6)
+
+#### A. Missing SOT columns
+
+* Compare SOT vs source (NOT output).
+* If a SOT column is NOT present in source → add to:
+  missing_in_source
+
+#### B. Remove "dropped_by_transform"
+
+* Completely remove this concept and related code.
+* Do NOT track or alert "dropped_by_transform".
+
+#### C. Extra columns
+
+* A column is considered extra if:
+
+  * NOT in UNIVERSAL_SOT_COLS
+  * AND does NOT end with:
+
+    * '_spend'
+    * '_impressions'
+    * '_impression'
+* These go into:
+  extra_cols
+
+---
+
+### 4. Alerting behavior
+
+Trigger schema drift alert ONLY if:
+
+* missing_in_source is not empty
+* OR extra_cols is not empty
+
+Update alert message to:
+
+"SCHEMA DRIFT:
+Missing in source: {missing_in_source},
+Extra columns: {extra_cols}"
+
+Do NOT include dropped_by_transform anywhere.
+
+---
+
+### 5. Ensure consistency
+
+* Remove all old or duplicate SOT definitions.
+* Ensure both reorder logic and drift logic use UNIVERSAL_SOT_COLS.
+* Avoid any mismatch between validation and transformation.
+
+---
+
+### 6. Do NOT modify
+
+* retailer column detection logic
+* logging helpers (_transfer_debug, _transfer_warning, etc.)
+* CSV generation logic
+
+---
+
+### Final Goal
+
+* The pipeline should NOT modify schema.
+* It should ONLY:
+
+  * preserve incoming data
+  * reorder columns
+  * validate schema
+  * send alerts for missing or unexpected columns
