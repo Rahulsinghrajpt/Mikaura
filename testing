@@ -1,36 +1,143 @@
-Here’s what that change would do, based on reorder_columns_sot and the TASK 6 drift block in mmm_dev_data_transfer/lambda_function.py.
+def reorder_columns_sot(
+    df, retailer_id: str, status_logger: Optional[Any] = None
+):
+    """
+    Reorder DataFrame columns to match SOT (Source of Truth) schema.
+    
+    TASK 5: Uses universal SOT from sot-files/walmart.csv as the base schema.
+    Output order: SOT columns first (exact order), then retailer-specific columns, then extras.
+    
+    Uses CASE-INSENSITIVE matching to handle column name variations.
+    Creates missing SOT columns with default values (0/NaN) if absent in source.
+    
+    Args:
+        df: DataFrame to reorder
+        retailer_id: Retailer identifier (e.g., 'walmart', 'amazon')
+    
+    Returns:
+        DataFrame with columns in SOT-first order, with missing SOT columns added
+    """
+    ordered_cols = []
+    
+    # TASK 5: Universal SOT schema from walmart.csv (remove retailer-specific columns)
+    # Order: Date, Sales, In_stock_Rate, GQV, OOH_impressions, OOH_spend,
+    #        PaidSocial_impressions, PaidSocial_spend, TV_impressions, TV_spend, Promo_flag
+    universal_sot_cols = [
+        'Date', 'Sales', 'In_stock_Rate', 'GQV',
+        'Promo_flag'
+    ]
+    
+    # Create case-insensitive lookup map: normalized -> actual column name
+    df_cols_normalized_map = {normalize_header_for_matching(col): col for col in df.columns}
+    df_cols_normalized = set(df_cols_normalized_map.keys())
+    
+    # Known media channel prefixes (to exclude from retailer detection)
+    media_channels_lower = {
+        'ooh_impressions', 'ooh_spend',
+        'paidsocial_impressions', 'paidsocial_spend',
+        'tv_impressions', 'tv_spend'
+    }
+    
+    # Track missing SOT columns to add with defaults
+    missing_sot_cols = []
+    
+    # TASK 5: Add SOT columns in exact order (if they exist in DataFrame)
+    for sot_col in universal_sot_cols:
+        sot_col_normalized = normalize_header_for_matching(sot_col)
+        if sot_col_normalized in df_cols_normalized:
+            actual_col = df_cols_normalized_map[sot_col_normalized]
+            ordered_cols.append(actual_col)
+        else:
+            # SOT column missing - will add with default value
+            missing_sot_cols.append(sot_col)
+    
+    # TASK 5: Add missing SOT columns with default values (0 for numeric, '' for text)
+    for missing_col in missing_sot_cols:
+        if missing_col == 'Promo_flag':
+            df[missing_col] = ''  # Text column
+        elif missing_col == 'Date':
+            # Date should already exist (renamed from Week), but if missing, use empty string
+            df[missing_col] = ''
+        else:
+            df[missing_col] = 0  # Numeric columns default to 0
+        ordered_cols.append(missing_col)
+        _transfer_info(
+            status_logger,
+            f"TASK 5: Added missing SOT column '{missing_col}' with default value",
+            missing_sot_column=missing_col,
+            retailer_id=retailer_id,
+        )
+    
+    # Add retailer-specific columns (spend before impressions)
+    # Find ANY retailer-specific spend/impressions columns
+    # Pattern: {Retailer}_spend, {Retailer}_impressions
+    # Exclude media channel columns (case-insensitive check)
+    retailer_spend_cols = []
+    retailer_impressions_cols = []
+    
+    for col in df.columns:
+        col_normalized = normalize_header_for_matching(col)
+        if col_normalized.endswith('_spend') and col_normalized not in media_channels_lower:
+            retailer_spend_cols.append(col)
+        elif (
+            col_normalized.endswith('_impressions') or col_normalized.endswith('_impression')
+        ) and col_normalized not in media_channels_lower:
+            retailer_impressions_cols.append(col)
+    
+    # FIX #3: LOG: Track retailer column detection
+    _transfer_debug(
+        status_logger,
+        "column_ordering",
+        f"reorder_columns_sot: Found {len(retailer_spend_cols)} retailer spend cols: {retailer_spend_cols}",
+        retailer_id=retailer_id,
+        retailer_spend_cols=retailer_spend_cols,
+    )
+    _transfer_debug(
+        status_logger,
+        "column_ordering",
+        f"reorder_columns_sot: Found {len(retailer_impressions_cols)} retailer impressions cols: {retailer_impressions_cols}",
+        retailer_id=retailer_id,
+        retailer_impressions_cols=retailer_impressions_cols,
+    )
 
-Names in code
-The list uses PaidSocial_impressions and PaidSocial_spend (not PaidSocial_impression / paidsocial_spend). Normalization is case-insensitive for matching, but the canonical names added when a column is missing are the strings in universal_sot_cols.
+    # Add retailer-specific columns in order (spend before impressions)
+    for col in retailer_spend_cols:
+        if col not in ordered_cols:
+            ordered_cols.append(col)
+            _transfer_debug(
+                status_logger,
+                "column_ordering",
+                f"reorder_columns_sot: Added retailer spend column '{col}'",
+                retailer_id=retailer_id,
+                column=col,
+            )
+    for col in retailer_impressions_cols:
+        if col not in ordered_cols:
+            ordered_cols.append(col)
+            _transfer_debug(
+                status_logger,
+                "column_ordering",
+                f"reorder_columns_sot: Added retailer impressions column '{col}'",
+                retailer_id=retailer_id,
+                column=col,
+            )
 
-1. reorder_columns_sot (first universal_sot_cols, ~2157–2178)
-That list drives:
-
-Order: SOT columns are placed first, in list order; then retailer-specific spend/impression columns; then everything else.
-Missing columns: Any name still in the list but absent from the frame gets created (numeric → 0, Promo_flag → '', Date → '') and an info log.
-If you remove OOH_impressions, PaidSocial_impressions, PaidSocial_spend, and TV_impressions:
-
-They are no longer in the “SOT front” block, so they are not auto-added with 0 when missing.
-They are not treated as retailer columns either, because media_channels_lower still excludes normalized names like ooh_impressions, paidsocial_impressions, tv_impressions, and the *_spend channel names (~2169–2174).
-So if those columns exist in the data, they are picked up only in “Add any remaining columns not in the schema” (~2260–2270): they become trailing “extra” columns (still present, but different position than today—no longer guaranteed right after GQV / with the other universal media fields).
-If a file never had one of them, it stays absent (no synthetic column).
-OOH_spend and TV_spend stay in the list unless you remove those too; behavior for them is unchanged.
-
-2. Schema drift (second universal_sot_cols, ~3673–3698)
-The same list (you should keep both copies in sync) defines what counts as “SOT” for drift:
-
-Removing those four names means the drift loop no longer checks whether those columns are missing from output vs source, so you won’t get TASK 6 classifications or Slack schema-drift signal specifically for those fields from that loop.
-extra_cols (~3700–3710) already ignores columns whose normalized names end with _spend, _impressions, or _impression, so those channel columns usually would not have been reported as “extra” even when they were in SOT; removing them from the list mainly changes missing/dropped detection, not “extra” detection for those names.
-
-3. Critical column check (~3739–3741)
-critical_cols is only Sales, In_stock_Rate, Promo_flag. Removing the media columns does not by itself trigger that critical error.
-
-Practical summary
-Effect	What happens
-Column order	OOH/TV/PaidSocial impression (and PaidSocial spend if removed) columns move from fixed SOT prefix to the extras tail (before Promo_flag is forced last).
-Missing in file	Those columns are not filled with 0 anymore.
-Drift / Slack	Those names are no longer part of the universal SOT drift comparison.
-Downstream	Anything assuming walmart.csv-style universal column order or presence of those four may see different layout or absent columns.
-If you only edit one of the two universal_sot_cols definitions (~2157 and ~3673), reorder and drift logic will diverge, which is usually a bug—both should match.
-
-I’m in Ask mode; if you want the repo updated consistently (both sites, tests, docs), switch to Agent mode.
+    # Add any remaining columns not in the schema (preserve extras)
+    for col in df.columns:
+        if col not in ordered_cols:
+            ordered_cols.append(col)
+            _transfer_debug(
+                status_logger,
+                "column_ordering",
+                f"Added extra column '{col}' to output (not in SOT schema)",
+                retailer_id=retailer_id,
+                column=col,
+            )
+    
+    # STEP 6: Ensure Promo_flag remains last (even when extras exist)
+    # This maintains the contract that Promo_flag is always the last column
+    if 'Promo_flag' in ordered_cols:
+        ordered_cols.remove('Promo_flag')
+    ordered_cols.append('Promo_flag')  # Always last
+    
+    return df[ordered_cols]
