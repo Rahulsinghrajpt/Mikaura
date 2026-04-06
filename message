@@ -1,3 +1,20 @@
-Right now, the high priority is to add "actual_brand_entity_id" and the country code to both pipeline info and client metadata to unblock the DS team.
+# Default approach (soft failure)
+def _transfer_error(status_logger, message, reason=None, **fields):
+    if status_logger:
+        status_logger.log_error(message, reason=reason or message, **fields)
+    else:
+        # Log to stderr but don't fail
+        sys.stderr.write(f"[STATUS_LOGGER_UNAVAILABLE] {message}\n")
+        
+        # Optional: Add to environment variable to control behavior
+        if os.environ.get('FAIL_ON_MISSING_LOGGER', 'false').lower() == 'true':
+            raise RuntimeError("Status logger was not available")
 
-Could you please let me know what value should be stored in "actual_brand_entity_id"? After that, I’ll work on the MikAura logger as well. It’s a small task, and I’ll try to complete it today.
+
+implement a logic like this, otherwise he will come back again with comments regarding exception.
+
+Default: Soft failure (current plan)
+Optional: Hard failure (via environment variable)
+
+
+Client can choose behavior without code change
