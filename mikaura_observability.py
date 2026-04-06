@@ -52,6 +52,7 @@ import json
 import os
 import random
 import re
+import socket
 import sys
 import warnings
 import time
@@ -456,6 +457,96 @@ class MikAuraStatusLogger:
 
 
 # ---------------------------------------------------------------------------
+# Inlined DogStatsD client (no dependency on metrics_utils.py)
+# ---------------------------------------------------------------------------
+
+_DEFAULT_DOGSTATSD_HOST = "127.0.0.1"
+_DEFAULT_DOGSTATSD_PORT = 8125
+
+
+def _dogstatsd_enabled() -> bool:
+    explicit = os.environ.get("DD_METRICS_ENABLED", "").strip().lower()
+    if explicit in ("0", "false", "no", "off"):
+        return False
+    if explicit in ("1", "true", "yes", "on"):
+        return True
+    return bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+
+def _parse_dd_global_tags() -> List[str]:
+    raw = os.environ.get("DD_METRIC_TAGS", "").strip()
+    if not raw:
+        return []
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
+
+class _InlinedMetricsClient:
+    """Lightweight DogStatsD UDP client (fire-and-forget)."""
+
+    __slots__ = ("_host", "_port", "_enabled", "_global_tags", "_sock")
+
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        enabled: Optional[bool] = None,
+    ) -> None:
+        self._host = host or os.environ.get("DD_AGENT_HOST", _DEFAULT_DOGSTATSD_HOST)
+        self._port = int(
+            os.environ.get("DD_DOGSTATSD_PORT", str(port or _DEFAULT_DOGSTATSD_PORT))
+        )
+        self._enabled = _dogstatsd_enabled() if enabled is None else enabled
+        self._global_tags = _parse_dd_global_tags()
+        self._sock: Optional[socket.socket] = None
+
+    def _send(self, payload: str) -> None:
+        if not self._enabled:
+            return
+        try:
+            if self._sock is None:
+                self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self._sock.settimeout(0.05)
+            self._sock.sendto(payload.encode("utf-8"), (self._host, self._port))
+        except OSError:
+            pass
+
+    def _line(
+        self, name: str, value: str, mtype: str, tags: Optional[List[str]] = None
+    ) -> str:
+        parts = list(self._global_tags)
+        if tags:
+            parts.extend(t for t in tags if t)
+        tag_str = "|#" + ",".join(parts) if parts else ""
+        return f"{name}:{value}|{mtype}{tag_str}"
+
+    def increment(
+        self, name: str, value: int = 1, tags: Optional[List[str]] = None
+    ) -> None:
+        self._send(self._line(name, str(value), "c", tags))
+
+    def gauge(self, name: str, value: float, tags: Optional[List[str]] = None) -> None:
+        self._send(self._line(name, str(value), "g", tags))
+
+    def histogram(
+        self, name: str, value: float, tags: Optional[List[str]] = None
+    ) -> None:
+        self._send(self._line(name, str(value), "h", tags))
+
+    def timing(
+        self, name: str, value_ms: float, tags: Optional[List[str]] = None
+    ) -> None:
+        self._send(self._line(name, str(value_ms), "ms", tags))
+
+    def close(self) -> None:
+        if self._sock:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+
+# ---------------------------------------------------------------------------
 # No-op metrics fallback
 # ---------------------------------------------------------------------------
 
@@ -530,8 +621,6 @@ class MikAuraMetricLogger:
     def client(self) -> Any:
         if self._client is None:
             try:
-                from utils.metrics_utils import MetricsUtils
-
                 kwargs: Dict[str, Any] = {}
                 if self._host is not None:
                     kwargs["host"] = self._host
@@ -539,7 +628,7 @@ class MikAuraMetricLogger:
                     kwargs["port"] = self._port
                 if self._enabled is not None:
                     kwargs["enabled"] = self._enabled
-                self._client = MetricsUtils(**kwargs)
+                self._client = _InlinedMetricsClient(**kwargs)
             except Exception:
                 self._client = _NoOpMetrics()
         return self._client
