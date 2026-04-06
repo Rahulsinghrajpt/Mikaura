@@ -129,9 +129,15 @@ def lambda_handler(event, context):
 
 ### Status Logging Pattern
 
-Each Lambda defines thin wrapper functions to safely call the logger:
+Each Lambda defines thin wrapper functions to safely call the logger. A shared private helper `_check_logger_required()` handles the fallback when the status logger is unavailable:
 
 ```python
+def _check_logger_required(message: str) -> None:
+    """Write stderr when status_logger is unavailable; optionally hard-fail via env."""
+    sys.stderr.write(f"[STATUS_LOGGER_UNAVAILABLE] {message}\n")
+    if os.environ.get("FAIL_ON_MISSING_LOGGER", "false").lower() == "true":
+        raise RuntimeError(f"Status logger was not available: {message}")
+
 def _my_lambda_info(status_logger, message, **extra):
     if status_logger:
         status_logger.log_info(message, force=True, **extra)
@@ -144,10 +150,16 @@ def _my_lambda_failed(status_logger, message, reason, **extra):
     if status_logger:
         status_logger.log_failed(message, reason=reason, **extra)
     else:
-        print(f"[ERROR] {message}: {reason}")
+        _check_logger_required(f"{message}: {reason}")
+
+def _my_lambda_exception(status_logger, message, exc, **extra):
+    if status_logger:
+        status_logger.log_exception(message, exc, **extra)
+    else:
+        _check_logger_required(f"{message}: {exc}")
 ```
 
-The `if status_logger:` guard ensures the code works even when MikAura is unavailable.
+The `if status_logger:` guard ensures the code works even when MikAura is unavailable. When the logger is missing, `_check_logger_required` writes a structured `[STATUS_LOGGER_UNAVAILABLE]` line to stderr (visible in CloudWatch Logs) and optionally raises `RuntimeError` if the `FAIL_ON_MISSING_LOGGER` environment variable is set to `true`.
 
 ### Metric Emission Pattern
 
@@ -328,6 +340,7 @@ result = metric_logger.health_check()
 | `DD_DOGSTATSD_PORT` | `8125` | MetricLogger | DogStatsD port |
 | `DD_METRIC_TAGS` | (empty) | MetricLogger | Comma-separated global tags (e.g., `team:data,service:ingestion`) |
 | `AWS_LAMBDA_FUNCTION_NAME` | (set by AWS) | MetricLogger | Auto-enables metrics when running in Lambda |
+| `FAIL_ON_MISSING_LOGGER` | `false` | StatusLogger fallback | When `true`, raises `RuntimeError` if status logger is unavailable instead of silently degrading |
 
 ---
 
@@ -341,11 +354,23 @@ Is mikaura_observability.py available?
 │       └── No dependency on metrics_utils.py
 │
 └── NO
-    ├── StatusLogger: not available (print() fallback in some Lambdas)
+    ├── StatusLogger: not available
+    │   └── _check_logger_required() writes "[STATUS_LOGGER_UNAVAILABLE]" to stderr
+    │       └── FAIL_ON_MISSING_LOGGER=true? → RuntimeError raised
+    │       └── FAIL_ON_MISSING_LOGGER=false (default)? → pipeline continues
     └── Is metrics_utils.py available?
         ├── YES → DogStatsD via MetricsUtils (basic tags only)
         └── NO  → No metrics sent (silent no-op, no crash)
 ```
+
+### Logger-Missing Behavior Matrix
+
+| `FAIL_ON_MISSING_LOGGER` | MikAura available | Result |
+|---|---|---|
+| `false` (default) | Yes | Normal structured logging |
+| `false` (default) | No | `[STATUS_LOGGER_UNAVAILABLE]` on stderr, pipeline continues |
+| `true` | Yes | Normal structured logging |
+| `true` | No | `[STATUS_LOGGER_UNAVAILABLE]` on stderr + `RuntimeError` raised |
 
 ---
 
@@ -396,6 +421,12 @@ The only required context key is `pipeline_context`. Everything else is your cho
 ### Step 3: Define helper wrappers (recommended)
 
 ```python
+def _check_logger_required(message: str) -> None:
+    """Write stderr when status_logger is unavailable; optionally hard-fail via env."""
+    sys.stderr.write(f"[STATUS_LOGGER_UNAVAILABLE] {message}\n")
+    if os.environ.get("FAIL_ON_MISSING_LOGGER", "false").lower() == "true":
+        raise RuntimeError(f"Status logger was not available: {message}")
+
 def _my_pipeline_info(status_logger, message, **extra):
     if status_logger:
         status_logger.log_info(message, force=True, **extra)
@@ -408,8 +439,16 @@ def _my_pipeline_failed(status_logger, message, reason, **extra):
     if status_logger:
         status_logger.log_failed(message, reason=reason, **extra)
     else:
-        print(f"[ERROR] {message}: {reason}")
+        _check_logger_required(f"{message}: {reason}")
+
+def _my_pipeline_exception(status_logger, message, exc, **extra):
+    if status_logger:
+        status_logger.log_exception(message, exc, **extra)
+    else:
+        _check_logger_required(f"{message}: {exc}")
 ```
+
+By default `_check_logger_required` is a soft failure (stderr only). Set `FAIL_ON_MISSING_LOGGER=true` in the Lambda environment to make it a hard failure.
 
 ### Step 4: Use in your handler
 
@@ -499,6 +538,26 @@ except ImportError:
 ENVIRONMENT = os.environ.get("ENVIRONMENT", "dev")
 
 
+def _check_logger_required(message: str) -> None:
+    sys.stderr.write(f"[STATUS_LOGGER_UNAVAILABLE] {message}\n")
+    if os.environ.get("FAIL_ON_MISSING_LOGGER", "false").lower() == "true":
+        raise RuntimeError(f"Status logger was not available: {message}")
+
+
+def _predict_running(sl, message, **extra):
+    if sl:
+        sl.log_running(message, **extra)
+    else:
+        _check_logger_required(message)
+
+
+def _predict_exception(sl, message, exc, **extra):
+    if sl:
+        sl.log_exception(message, exc, **extra)
+    else:
+        _check_logger_required(f"{message}: {exc}")
+
+
 def lambda_handler(event, context):
     execution_id = context.aws_request_id
 
@@ -519,8 +578,7 @@ def lambda_handler(event, context):
         ml = MikAuraMetricLogger.from_config(config)
 
     # --- Run pipeline ---
-    if sl:
-        sl.log_running("Prediction pipeline started")
+    _predict_running(sl, "Prediction pipeline started")
 
     try:
         start = time.monotonic()
@@ -543,8 +601,7 @@ def lambda_handler(event, context):
     except Exception as e:
         if ml:
             ml.increment("prediction.outcome", extra_tags=["result:failed"])
-        if sl:
-            sl.log_exception("Prediction pipeline failed", e)
+        _predict_exception(sl, "Prediction pipeline failed", e)
         raise
 ```
 
@@ -573,8 +630,10 @@ All metrics automatically carry context tags: `pipeline_context`, `client_name`,
 
 3. **Immutable loggers**: `derive()` and `with_context()` return new instances. The parent logger is never mutated.
 
-4. **Fail-safe**: Every metric call is wrapped in try/except. Observability code never breaks the pipeline.
+4. **Fail-safe with configurable strictness**: Every metric call is wrapped in try/except. When the status logger is unavailable, `_check_logger_required()` writes a structured `[STATUS_LOGGER_UNAVAILABLE]` line to stderr (soft failure by default). Set `FAIL_ON_MISSING_LOGGER=true` to opt in to hard failure (`RuntimeError`). This lets operators choose between resilience and strict observability enforcement without code changes.
 
 5. **Sensitive data redaction**: Passwords, API keys, and secrets are automatically scrubbed from log messages.
 
 6. **Datadog trace correlation**: If the `ddtrace` library is available, `dd.trace_id` and `dd.span_id` are automatically injected into log entries.
+
+7. **No raw `print()` in fallback paths**: All status-logger-missing paths use `sys.stderr.write` with the `[STATUS_LOGGER_UNAVAILABLE]` prefix. This ensures every fallback message is structured and searchable in CloudWatch Logs.
