@@ -1,8 +1,29 @@
+The two log paths happening per retailer transfer
+Path 1: MikAura lifecycle logs (_transfer_info, _transfer_warning, etc.)
+These call status_logger.log_info(message, **fields) which internally runs _build_entry() + _emit() to print a flat JSON line:
 
-Update:
+{"pipeline_context":"Data Ingestion Pipeline","client_name":"madebygather","status":"info","message":"Lambda 2 completed: 3 files, 142 records","files_processed":3,"records_processed":142,"level":"INFO","timestamp":"...","correlation_id":"...","environment":"dev"}
+These are operational lifecycle logs -- "Lambda started", "Lambda completed", "file skipped", etc. Their status is always the MikAura log level (info, warning, error), not the transfer outcome (success, no_file, failed).
 
-We need to implement two additional data drift checks. While reviewing and understanding the script shared by Seema, we identified an issue in our current approach.
+Path 2: emit_ingestion_observability_log() (line 4472)
+This is the outcome summary log -- one per retailer, emitted after the file processing loop finishes. It carries the actual transfer result (SUCCESS/NO_FILES/FAILED), file counts, failure reasons, and extra metadata like use_case, data_source_provider, data_source_bucket. It prints:
 
-The profile.json we have implemented currently is only for the target retailer. As per the script provided in Seema’s document, we need to generate a separate profile.json for each retailer using that script. However, we are currently using the same profile across all datasets, which makes our drift detection rely on a static reference and results in alerts being triggered for almost every dataset.
+{"ingestion":{"evt":"transfer","client_id":"X","status":"SUCCESS","files_processed":3,"records_processed":142,"country":"US",...},"mikaura":{...}}
+This function exists because MikAura's log_info() / log_error() alone cannot express:
 
-To address this properly, we need to make the logic more dynamic by calculating historical statistics for each retailer individually .
+The computed transfer status (SUCCESS vs NO_FILES vs PARTIAL vs FAILED)
+The ingestion-specific fields (evt, use_case, data_source_provider, data_source_bucket)
+The backward-compatible ingestion nested object (for older Datadog dashboards)
+Why this is causing your Datadog widget problems
+The problem is that these two paths collide in Datadog:
+
+MikAura _transfer_info log	emit_ingestion_observability_log
+files_processed location	flat (top-level)	nested (ingestion.files_processed)
+status value	always info	the actual outcome (success, no_file, etc.)
+Widget matches @files_processed:*?	Yes (wrong status)	No (field is nested)
+So your widgets either see the wrong log (MikAura lifecycle with status: info) or see nothing (files_processed:0 doesn't exist at root).
+
+Bottom line
+emit_ingestion_observability_log exists to produce one structured outcome-summary log per retailer transfer with transfer-specific fields that MikAura's generic log_info() doesn't carry. The problem isn't that it exists -- it's that it wraps everything inside {"ingestion": {...}} instead of emitting those fields flat at the top level.
+
+The plan we created addresses exactly this: promote the key fields to the JSON root so both the observability log and the flat Datadog widgets align. If you want me to implement that, switch to Agent mode and confirm the plan.
