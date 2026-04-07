@@ -1,20 +1,8 @@
-# Default approach (soft failure)
-def _transfer_error(status_logger, message, reason=None, **fields):
-    if status_logger:
-        status_logger.log_error(message, reason=reason or message, **fields)
-    else:
-        # Log to stderr but don't fail
-        sys.stderr.write(f"[STATUS_LOGGER_UNAVAILABLE] {message}\n")
-        
-        # Optional: Add to environment variable to control behavior
-        if os.environ.get('FAIL_ON_MISSING_LOGGER', 'false').lower() == 'true':
-            raise RuntimeError("Status logger was not available")
 
+Update:
 
-implement a logic like this, otherwise he will come back again with comments regarding exception.
+We need to implement two additional data drift checks. While reviewing and understanding the script shared by Seema, we identified an issue in our current approach.
 
-Default: Soft failure (current plan)
-Optional: Hard failure (via environment variable)
+The profile.json we have implemented currently is only for the target retailer. As per the script provided in Seema’s document, we need to generate a separate profile.json for each retailer using that script. However, we are currently using the same profile across all datasets, which makes our drift detection rely on a static reference and results in alerts being triggered for almost every dataset.
 
-
-Client can choose behavior without code change
+To address this properly, we need to make the logic more dynamic by calculating historical statistics for each retailer individually .
