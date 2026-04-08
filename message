@@ -1,13 +1,35 @@
-We need to migrate the latest data ingestion Lambda code into the existing CI/CD structured codebase.
+There are two key differences causing the values to diverge:
 
-I have already uploaded the target file. Please update it by incorporating all the latest changes, including:
+Difference 1: Profile Training Data Split
+Notebook (line profile = build_reference_profile(train_df ...)):
 
-Integration of the MikAura logger
-Any newly created functions
-Updates and improvements from the latest version of the data ingestion Lambdas
+Builds profile from train_df = 157 rows (all original rows, explicitly excluding the 7 injected case rows)
+This is clean historical data only
+Lambda (dynamic_drift_profile.py -> prepare_drift_data):
 
-Ensure that:
+Calls prepare_drift_data(df) which splits as: historical_df = df.iloc[:-1] and latest_df = df.iloc[-1:]
+Builds profile from historical_df = all rows except the very last one
+If the data file contains the injected rows, the profile would include the first 6 injected case rows (CASE_1 through CASE_6) in the training data -- only CASE_7 would be the "latest" row being scored
+This is the biggest source of divergence. The notebook carefully excludes all injected rows from training; the Lambda naively takes "everything except last row" as training data. So:
 
-The code aligns with the current CI/CD structure and standards
-Existing functionality remains intact
-The updated code is clean, consistent, and production-ready
+The Lambda's mean, std, p99 are polluted by the extreme values of CASE_1-CASE_6
+The notebook's mean, std, p99 are computed from clean historical data only
+For example, CASE_1 (CASE_1_SPEND_SHOCK_3X) has 3x spend values. If those 3x values are included in the Lambda's training data, they inflate the mean and std, which changes the z-score for the row being tested.
+
+Difference 2: Which Row Gets Scored
+Notebook: Scores each injected case row individually against the clean profile (loops over all 7 cases)
+
+Lambda: Only scores the last row (retailer_df.iloc[-1]). If the data has all 7 injected rows appended, the Lambda scores only CASE_7 (the last one), not CASE_1.
+
+Difference 3: KPI Residual Calculation
+Notebook score_one_week(): Computes y_hat directly from the ridge beta and the current row's features. The resid_z uses resid_mean and resid_std from the profile.
+
+Lambda detect_kpi_behavior_break(): Also uses _predict_log_kpi_from_profile() to get y_hat, BUT it additionally computes kpi_delta and spend_delta between retailer_df.iloc[-1] and retailer_df.iloc[-2], and checks for opposite_direction. The notebook's score_one_week doesn't have this opposite-direction logic.
+
+Summary
+Aspect	Notebook	Lambda
+Training data	157 clean rows (excludes injected)	All rows except last (includes other injected rows)
+Row scored	Each case individually	Only the last row in file
+Profile stats	Pure historical baseline	Contaminated by injected outliers
+KPI check	Pure residual z-score	Residual z + opposite direction + event suppression
+The contaminated training data is the main reason the z-scores and p99 values differ. To get matching values, the Lambda's prepare_drift_data() would need to filter out rows tagged as injected cases, or the test data fed to the Lambda should only contain clean historical rows + one test case at a time.
