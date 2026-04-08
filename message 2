@@ -1,0 +1,59 @@
+Root Cause: Ridge Regression Model is Meaningless with Zero Total Spend
+This false positive has a different root cause than the p99 issue, but it's in the same family -- the model can't handle edge cases in the data distribution.
+
+What's happening:
+The last 4 rows of the dataset have ALL spend channels at zero:
+
+"2025-05-05","444194.32","0.894253","96","0","0.0","0.0","0.0","0","0.0","Promo Retail  Below ELC"
+"2025-05-12","374755.88","0.900225","45","0","0.0","0.0","0.0","0","0.0","Promo Retail  Above ELC"
+"2025-05-19","570407.85","0.855402","43","0","0.0","0.0","0.0","0","0.0","Promo Retail  Below ELC"
+"2025-05-26","626807.21","0.807143","41","0","0.0","0.0","0.0","0","0.0","Promo Retail  Above ELC"
+Bestbuy_spend=0, OOH_spend=0, TV_spend=0 -- yet Bestbuy_sales=626,807.
+
+Step-by-step trace through the code:
+infer_schema detects:
+
+spend_cols: Bestbuy_spend, OOH_spend, TV_spend
+kpi_col: Bestbuy_sales (via _sales suffix)
+control_cols: GQV
+event_cols: none (Promo_flag is text, In_stock_Rate is continuous -- neither is binary)
+build_reference_profile fits a ridge regression on 73 historical rows:
+
+Features: log1p(Bestbuy_spend), log1p(OOH_spend), log1p(TV_spend), z(GQV), intercept
+Target: log1p(Bestbuy_sales)
+_predict_log_kpi_from_profile for the latest row (row 75):
+
+All spend = 0 → all log1p(spend) features = 0
+Prediction degrades to: intercept + beta_GQV * z(41) -- no spend signal at all
+Residual computation:
+
+actual_log_kpi = log1p(626807) ≈ 13.35
+predicted_log_kpi ≈ intercept + small GQV contribution (likely much lower than 13.35)
+residual = actual - predicted → large positive value
+residual_z = (residual - resid_mean) / resid_std = 4.74 → exceeds RED threshold (4.0)
+Why this is a false positive:
+The ridge regression model learns: "higher spend → higher KPI". When ALL spend is zero, the model predicts a low KPI. But in reality, sales can be significant even without recorded media spend (organic demand, brand equity, etc.). The large residual (z=4.74) reflects the model's inability to predict zero-spend scenarios, not an actual behavior break.
+
+A KPI "behavior break" is supposed to detect when the relationship between spend and KPI shifts. When there's no spend at all, there's no meaningful relationship to evaluate -- the residual is noise, not signal.
+
+Additional issue: "Promo_flag" and "In_stock_Rate" are excluded from the model
+The schema inference ignores:
+
+In_stock_Rate -- a clearly important predictor for retail sales, but not in KNOWN_CONTROL_COLS
+Promo_flag -- promotional context (text column, not binary)
+This makes the model weaker, amplifying residuals.
+
+Recommended fix:
+In detect_kpi_behavior_break, skip detection when the latest row's total spend is zero or near-zero. The model has no predictive signal in this scenario:
+
+# After computing latest_total_spend (around line 667-668):
+if latest_total_spend < 1e-9:
+    return {
+        'detected': False,
+        'severity': 'NONE',
+        'anomalies': [],
+        'drift_metric_current': 0.0,
+    }
+This is the targeted fix for the immediate false positive. A broader improvement would be to also include non-standard control columns (like In_stock_Rate) in the ridge model via schema inference, but that's a larger change.
+
+Would you like me to switch to Agent mode to implement the fix?
