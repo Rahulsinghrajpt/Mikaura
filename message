@@ -1,35 +1,45 @@
-There are two key differences causing the values to diverge:
+Root Cause: Overly Sensitive p99 Standalone Trigger
+This is a false positive caused by the OR-based trigger logic in detect_spend_regime_shift.
 
-Difference 1: Profile Training Data Split
-Notebook (line profile = build_reference_profile(train_df ...)):
+What happens step-by-step:
+The file has 157 data rows (no injected data at all).
 
-Builds profile from train_df = 157 rows (all original rows, explicitly excluding the 7 injected case rows)
-This is clean historical data only
-Lambda (dynamic_drift_profile.py -> prepare_drift_data):
+prepare_drift_data() splits it into:
 
-Calls prepare_drift_data(df) which splits as: historical_df = df.iloc[:-1] and latest_df = df.iloc[-1:]
-Builds profile from historical_df = all rows except the very last one
-If the data file contains the injected rows, the profile would include the first 6 injected case rows (CASE_1 through CASE_6) in the training data -- only CASE_7 would be the "latest" row being scored
-This is the biggest source of divergence. The notebook carefully excludes all injected rows from training; the Lambda naively takes "everything except last row" as training data. So:
+Historical = rows 1-156 (used to build the profile)
+Latest = row 157 (scored against the profile) -- line 158 in the file:
+2025-12-29,840012.54,6205771,50713.44,2854987,16267.04,4015894,21977.93,1965510,11622.57,3938121,100706.08,8267789,128549.22,121.4133351,0.598407643,0,0,0,0,0,0,0,0
+The OOH_spend of the latest row is 128,549.22.
 
-The Lambda's mean, std, p99 are polluted by the extreme values of CASE_1-CASE_6
-The notebook's mean, std, p99 are computed from clean historical data only
-For example, CASE_1 (CASE_1_SPEND_SHOCK_3X) has 3x spend values. If those 3x values are included in the Lambda's training data, they inflate the mean and std, which changes the z-score for the row being tested.
+The p99 of the 156 historical OOH_spend values came out to 127,250.74 -- the latest value exceeds p99 by only ~1,299 (about 1%).
 
-Difference 2: Which Row Gets Scored
-Notebook: Scores each injected case row individually against the clean profile (loops over all 7 cases)
+The z-score is 2.7486, which is below the YELLOW threshold of 3.0.
 
-Lambda: Only scores the last row (retailer_df.iloc[-1]). If the data has all 7 injected rows appended, the Lambda scores only CASE_7 (the last one), not CASE_1.
+The bug is in the trigger condition:
+    z_yellow = _to_float(thresholds.get('Z_OUTLIER_YELLOW')) or SPEND_REGIME_Z_YELLOW_DEFAULT
+    z_red = _to_float(thresholds.get('Z_OUTLIER_RED')) or SPEND_REGIME_Z_RED_DEFAULT
+    latest_row = retailer_df.iloc[-1]
+    // ... channel loop ...
+        yellow_trigger = abs_z_score >= z_yellow or exceeds_p99
+        red_trigger = abs_z_score >= z_red or exceeds_p995
+The or exceeds_p99 makes p99 exceedance a standalone trigger, independent of z-score. This means:
 
-Difference 3: KPI Residual Calculation
-Notebook score_one_week(): Computes y_hat directly from the ridge beta and the current row's features. The resid_z uses resid_mean and resid_std from the profile.
+Even though z = 2.75 (below 3.0 = safe by z-score standards), the alert fires purely because 128,549.22 > 127,250.74 (p99).
+For a dataset of ~157 rows, p99 corresponds to roughly the top 1-2 values. So if the latest row just happens to be one of the higher historical values, it gets flagged as an "anomaly" even though it's perfectly normal data.
+Why this is a design flaw:
+The p99 threshold is statistically meaningless for small datasets. With 156 historical rows, p99 essentially sits between the highest and second-highest value. Any new data point that lands near the historical maximum will exceed p99 -- that's expected ~1% of the time for clean data, which is too frequent for a production alert.
 
-Lambda detect_kpi_behavior_break(): Also uses _predict_log_kpi_from_profile() to get y_hat, BUT it additionally computes kpi_delta and spend_delta between retailer_df.iloc[-1] and retailer_df.iloc[-2], and checks for opposite_direction. The notebook's score_one_week doesn't have this opposite-direction logic.
+Recommended fix:
+Change the trigger logic so p99/p995 are not standalone triggers, but instead act as severity amplifiers when combined with a minimum z-score floor. Something like:
 
-Summary
-Aspect	Notebook	Lambda
-Training data	157 clean rows (excludes injected)	All rows except last (includes other injected rows)
-Row scored	Each case individually	Only the last row in file
-Profile stats	Pure historical baseline	Contaminated by injected outliers
-KPI check	Pure residual z-score	Residual z + opposite direction + event suppression
-The contaminated training data is the main reason the z-scores and p99 values differ. To get matching values, the Lambda's prepare_drift_data() would need to filter out rows tagged as injected cases, or the test data fed to the Lambda should only contain clean historical rows + one test case at a time.
+# Only trigger if z-score alone is high enough
+yellow_trigger = abs_z_score >= z_yellow
+# OR if both z-score is moderately high AND p99 is exceeded (combined signal)
+yellow_trigger = yellow_trigger or (abs_z_score >= z_yellow * 0.75 and exceeds_p99)
+# Red severity requires z-score OR p995 (p995 is a much rarer threshold)
+red_trigger = abs_z_score >= z_red or exceeds_p995
+Or the simpler approach -- remove the standalone p99 trigger entirely and use p99/p995 only for severity escalation:
+
+yellow_trigger = abs_z_score >= z_yellow
+red_trigger = abs_z_score >= z_red or exceeds_p995
+This way, a normal data point at z=2.75 would never trigger an alert, regardless of p99. To implement this fix, you'd need to switch to Agent mode.
