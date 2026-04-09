@@ -1,3 +1,4 @@
-Can't approve. I see you have merged integration and staging branches into your feature branch which is not the correct way. This PR now have changes of other tickets too which will get deployed on prod if we merge this PR.
-
-Please create a new branch from main, cherry pick your commits (related to your ticket only) from existing feature branch. Then create the PR again for integration, staging, and main
+Hii @Aditya Tiwari i have raised a PR can u check this 
+https://github.com/Swaven/MikGorilla.AI/pull/176
+in this i have resolved the issue which i informed to you yesterday. 
+because, manish is not approving my PR he is saying that in this pr prediction pipeline code is changed by you and i tell to him that aditya said to me for the changes.
