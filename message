@@ -1,4 +1,24 @@
-Hii @Aditya Tiwari i have raised a PR can u check this 
-https://github.com/Swaven/MikGorilla.AI/pull/176
-in this i have resolved the issue which i informed to you yesterday. 
-because, manish is not approving my PR he is saying that in this pr prediction pipeline code is changed by you and i tell to him that aditya said to me for the changes.
+Here's exactly what's happening:
+
+Why the alert fires at all
+The z-scores (3.22, 3.34, 3.37) are all above 3.0 (the YELLOW threshold), so yellow_trigger is True and the alert fires correctly. The Google_spend values in the latest week are genuinely high compared to the historical mean (~30,100) and std (~12,625).
+
+Why amazon and walmart are RED when z < 4.0
+The severity logic on line 373 is:
+
+red_trigger = abs_z_score >= z_red or exceeds_p995
+RED fires when either z >= 4.0 OR value > p995. Here's the proof from your data:
+
+Retailer	Google_spend (latest)	p995	value > p995?	z-score	z >= 4.0?	Severity
+amazon	72,284.17	70,938.31	Yes	3.34	No	RED (via p995)
+walmart	72,801.58	70,938.31	Yes	3.34	No	RED (via p995)
+target	70,831.86	~70,938*	No	3.22	No	YELLOW (z only)
+The p995 (99.5th percentile) on 169 historical rows is 70,938.31, and the max in history is 73,055.56. Amazon and walmart's latest Google_spend exceeded p995, so the or exceeds_p995 path promoted them to RED.
+
+Is this a bug?
+It's debatable. The code's docstring says "p995 is rare enough to standalone", but with only 169 rows, p995 is essentially the second-highest historical value. That makes the p995 path trigger on any value that's merely near the historical max — even when the z-score says it's only a moderate (YELLOW) anomaly.
+
+Would you like me to fix this by either:
+
+Removing p995 as a standalone RED trigger (only z >= 4.0 promotes to RED), or
+Adding a minimum sample size (e.g. only use p995 for RED when history has 500+ rows)?
