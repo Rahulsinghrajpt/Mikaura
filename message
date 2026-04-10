@@ -1,24 +1,12 @@
-Here's exactly what's happening:
+[7:04 pm, 10/4/2026] Prince BT: 09
+As per the latest update, I have successfully deployed the serverless Lambda migration to QA, and no issues have been observed so far. Currently, I am working on the data drift implementation
+[7:06 pm, 10/4/2026] Prince BT: 08
+As an update, I connected with Aditya to guide him on how logs and metrics are sent to Datadog.
 
-Why the alert fires at all
-The z-scores (3.22, 3.34, 3.37) are all above 3.0 (the YELLOW threshold), so yellow_trigger is True and the alert fires correctly. The Google_spend values in the latest week are genuinely high compared to the historical mean (~30,100) and std (~12,625).
+Regarding the serverless Lambda migration, it has been deployed on QA, and I will be testing it next.
+[7:07 pm, 10/4/2026] Prince BT: 07
+As an update, I have shared the logger utility class with Aditya and also connected with him to walk through how it can be used in the pipeline. Additionally, I have provided detailed documentation for the same.
 
-Why amazon and walmart are RED when z < 4.0
-The severity logic on line 373 is:
+Currently, I am working on the Lambda migration for data ingestion and have deployed it to QA.
 
-red_trigger = abs_z_score >= z_red or exceeds_p995
-RED fires when either z >= 4.0 OR value > p995. Here's the proof from your data:
-
-Retailer	Google_spend (latest)	p995	value > p995?	z-score	z >= 4.0?	Severity
-amazon	72,284.17	70,938.31	Yes	3.34	No	RED (via p995)
-walmart	72,801.58	70,938.31	Yes	3.34	No	RED (via p995)
-target	70,831.86	~70,938*	No	3.22	No	YELLOW (z only)
-The p995 (99.5th percentile) on 169 historical rows is 70,938.31, and the max in history is 73,055.56. Amazon and walmart's latest Google_spend exceeded p995, so the or exceeds_p995 path promoted them to RED.
-
-Is this a bug?
-It's debatable. The code's docstring says "p995 is rare enough to standalone", but with only 169 rows, p995 is essentially the second-highest historical value. That makes the p995 path trigger on any value that's merely near the historical max — even when the z-score says it's only a moderate (YELLOW) anomaly.
-
-Would you like me to fix this by either:
-
-Removing p995 as a standalone RED trigger (only z >= 4.0 promotes to RED), or
-Adding a minimum sample size (e.g. only use p995 for RED when history has 500+ rows)?
+I have also received information from Seema regarding the two data drifts that need to be implemented
